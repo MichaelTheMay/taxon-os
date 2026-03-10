@@ -8,6 +8,12 @@ export async function matchGBIF(name) {
     if (data.matchType === 'NONE') return null
     return data
   } catch { return null }
+}export async function fetchGBIFSpecies(usageKey) {
+  try {
+    const res = await fetch(`${BASE}/species/${usageKey}`)
+    if (!res.ok) return null
+    return res.json()
+  } catch { return null }
 }
 
 export async function fetchOccurrenceImages(taxonKey, limit = 8) {

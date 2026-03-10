@@ -21,16 +21,17 @@ export async function fetchNCBIGenome(scientificName) {
 
     const assembly = report.assembly_info
     const stats = report.assembly_stats
+    const accession = report.accession
 
     return {
       assemblyName: assembly?.assembly_name,
-      accession: assembly?.assembly_accession,
+      accession: accession,
       level: assembly?.assembly_level, // Complete Genome, Chromosome, Scaffold, Contig
-      submissionDate: assembly?.submission_date,
+      submissionDate: assembly?.release_date || assembly?.submission_date,
       totalLength: stats?.total_sequence_length,
       gcCount: stats?.total_gc_content,
       isSequenced: true,
-      ncbiUrl: `https://www.ncbi.nlm.nih.gov/datasets/genome/${assembly?.assembly_accession}/`
+      ncbiUrl: `https://www.ncbi.nlm.nih.gov/datasets/genome/${accession}/`
     }
   } catch (err) {
     console.warn('NCBI fetch failed:', err)

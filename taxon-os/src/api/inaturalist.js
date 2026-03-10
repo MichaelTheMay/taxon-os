@@ -10,7 +10,14 @@ export async function fetchInatTaxon(name) {
     return data.results?.[0] || null
   } catch { return null }
 }
-
+export async function fetchInatTaxonByID(id) {
+  try {
+    const res = await fetch(`${BASE}/taxa/${id}`)
+    if (!res.ok) return null
+    const data = await res.json()
+    return data.results?.[0] || null
+  } catch { return null }
+}
 export async function fetchInatObservations(taxonId, limit = 12) {
   try {
     const res = await fetch(

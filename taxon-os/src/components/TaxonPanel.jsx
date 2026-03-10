@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
 import { fetchWikiSummary } from '../api/wikipedia'
-import { matchGBIF, fetchOccurrenceImages, fetchOccurrenceCount, fetchOccurrencePoints, fetchSpeciesProfile, fetchYearlyOccurrences } from '../api/gbif'
-import { fetchInatTaxon, fetchInatObservations } from '../api/inaturalist'
+import { matchGBIF, fetchGBIFSpecies, fetchOccurrenceImages, fetchOccurrenceCount, fetchOccurrencePoints, fetchSpeciesProfile, fetchYearlyOccurrences } from '../api/gbif'
+import { fetchInatTaxon, fetchInatTaxonByID, fetchInatObservations } from '../api/inaturalist'
 import { fetchLineage } from '../api/otl'
 import { getIUCNColor, getIUCNLabel } from '../api/iucn'
 import { fetchWikidataQuickFacts } from '../api/wikidata'
-import { fetchEOLData } from '../api/eol'
+import { fetchEOLData, fetchEOLPage } from '../api/eol'
 import { fetchXCRecordings } from '../api/xenocanto'
 import { fetchNCBIGenome, formatGenomeSize } from '../api/ncbi'
+import { resolveTaxonIDs } from '../api/TaxonResolver'
 import OccurrenceMap from './OccurrenceMap'
 
 const TABS = [
@@ -60,11 +61,14 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
 
     const name = node.name
 
-    // Phase 1: core data
+    // NEW ROBUST AGGREGATION: Resolve IDs first via Crosswalk Cache
+    const ids = await resolveTaxonIDs(name)
+
+    // Phase 1: Core metadata and summaries
     const [wikiRes, gbifRes, inatRes, lineageRes] = await Promise.allSettled([
       fetchWikiSummary(name),
-      matchGBIF(name),
-      fetchInatTaxon(name),
+      ids.gbifKey ? fetchGBIFSpecies(ids.gbifKey) : matchGBIF(name),
+      ids.inatId ? fetchInatTaxonByID(ids.inatId) : fetchInatTaxon(name),
       node.ott_id ? fetchLineage(node.ott_id) : Promise.resolve([]),
     ])
 
@@ -72,16 +76,17 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
     if (inatRes.status === 'fulfilled') setInat(inatRes.value)
     if (lineageRes.status === 'fulfilled') setLineage(lineageRes.value)
 
-    // Phase 2: GBIF-dependent data
-    if (gbifRes.status === 'fulfilled' && gbifRes.value?.usageKey) {
-      const g = gbifRes.value
-      setGbif(g)
+    // Phase 2: GBIF-dependent data (Occurrences and Species Profile)
+    const gData = gbifRes.status === 'fulfilled' ? gbifRes.value : null
+    if (gData?.usageKey || gData?.key) {
+      const gKey = gData.usageKey || gData.key
+      setGbif(gData)
 
       const [imgs, cnt, prof, yearly] = await Promise.allSettled([
-        fetchOccurrenceImages(g.usageKey, 12),
-        fetchOccurrenceCount(g.usageKey),
-        fetchSpeciesProfile(g.usageKey),
-        fetchYearlyOccurrences(g.usageKey),
+        fetchOccurrenceImages(gKey, 12),
+        fetchOccurrenceCount(gKey),
+        fetchSpeciesProfile(gKey),
+        fetchYearlyOccurrences(gKey),
       ])
       if (imgs.status === 'fulfilled') setImages(imgs.value)
       if (cnt.status === 'fulfilled') setOccCount(cnt.value)
@@ -90,16 +95,17 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
     }
 
     // Phase 3: iNat observations
-    const inatData = inatRes.status === 'fulfilled' ? inatRes.value : null
-    if (inatData?.id) {
-      const obsRes = await fetchInatObservations(inatData.id, 12).catch(() => [])
+    const iData = inatRes.status === 'fulfilled' ? inatRes.value : null
+    if (iData?.id) {
+      const obsRes = await fetchInatObservations(iData.id, 12).catch(() => [])
       setInatObs(obsRes)
     }
 
-    // Phase 4: New data sources (non-blocking, run in background)
+    // Phase 4: Non-blocking data (Genome, Facts, Sound excerpts)
+    // Here we leverage the resolved IDs again
     Promise.allSettled([
       fetchWikidataQuickFacts(name),
-      fetchEOLData(name),
+      ids.eolId ? fetchEOLPage(ids.eolId) : fetchEOLData(name),
       fetchXCRecordings(name, 5),
       fetchNCBIGenome(name),
     ]).then(([wdRes, eolRes, xcRes, ncbiRes]) => {

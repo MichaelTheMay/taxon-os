@@ -8,6 +8,7 @@ import StatsBar from './components/StatsBar'
 import { matchNames, fetchChildren, fetchLineage, fetchMRCA } from './api/otl'
 import { soundEngine } from './api/SoundEngine'
 import { lifePulse } from './api/LifePulse'
+import { fetchCladeImagery } from './api/gbif'
 
 // ── Immutable tree update ────────────────────────────────────────────────────
 function updateNode(tree, id, updates) {
@@ -41,6 +42,18 @@ export default function App() {
   const [expandingNode, setExpandingNode] = useState(null) // ID of current root of recursion
   const [isAborting,   setIsAborting]   = useState(false)
   const [abortController, setAbortController] = useState(null)
+
+  // Visual Clusters & Node Imagery
+  const [cladeMetaData, setCladeMetaData] = useState({}) // id -> { name, images }
+  const [nodeIcons,     setNodeIcons]     = useState({}) // id -> url
+  const [labelConfig,   setLabelConfig]   = useState({
+    fontSize: 12,
+    fontWeight: 'normal',
+    glow: true,
+    uppercase: false,
+    visible: true
+  })
+  const [showSettings, setShowSettings] = useState(false)
 
   // ── Initialize tree on load ──────────────────────────────────────────────
   useEffect(() => {
@@ -134,6 +147,27 @@ export default function App() {
         _loading: false,
       }))
       setTotalExpanded(n => n + 1)
+
+      // Fetch clade imagery for the expanded node
+      const currentNode = (function findNode(t, id) {
+        if (!t) return null
+        if (t.id === id) return t
+        if (!t.children) return null
+        for (const c of t.children) {
+          const found = findNode(c, id)
+          if (found) return found
+        }
+        return null
+      })(tree, nodeId)
+
+      if (currentNode) {
+        fetchCladeImagery(currentNode.name).then(imgs => {
+          if (imgs.length > 0) {
+            setCladeMetaData(prev => ({ ...prev, [nodeId]: { name: currentNode.name, images: imgs } }))
+            setNodeIcons(prev => ({ ...prev, [nodeId]: imgs[0] })) // Set first image as node icon
+          }
+        })
+      }
     } catch (err) {
       console.error('Expand failed:', err)
       setTree(prev => updateNode(prev, nodeId, { _loading: false }))
@@ -200,7 +234,16 @@ export default function App() {
     } else {
       setLineage([])
     }
-  }, [])
+
+    // Fetch icon for selected node if not present
+    if (nodeData && !nodeIcons[nodeData.id]) {
+      fetchCladeImagery(nodeData.name).then(imgs => {
+        if (imgs.length > 0) {
+          setNodeIcons(prev => ({ ...prev, [nodeData.id]: imgs[0] }))
+        }
+      })
+    }
+  }, [nodeIcons])
 
   // ── Handle search selection with Auto-Navigation ────────────────────────
   const [navTarget, setNavTarget] = useState(null)
@@ -412,18 +455,76 @@ export default function App() {
             <button className="retry-btn" onClick={initTree}>Retry</button>
           </div>
         ) : (
-          <TreeCanvas
-            treeData={tree}
-            selectedNodeId={selectedNode?.id}
+        <>
+          <TreeCanvas 
+            treeData={tree} 
+            selectedNodeId={selectedNode?.id} 
             compareNodes={compareNodes}
             mrcaInfo={mrcaInfo}
+            cladeMetaData={cladeMetaData}
+            nodeIcons={nodeIcons}
+            labelConfig={labelConfig}
             onNodeSelect={handleNodeSelect}
             onNodeExpand={expandNode}
             onNodeCollapse={collapseNode}
           />
-        )}
 
-        {selectedNode && (
+          {/* Floating Settings Gear */}
+          <button 
+            className="settings-fab" 
+            onClick={() => setShowSettings(!showSettings)}
+            title="Tree Visualization Settings"
+          >
+            ⚙️
+          </button>
+
+          {showSettings && (
+            <div className="settings-popover glass">
+              <h3>Label Formatting</h3>
+              <div className="setting-control">
+                <label>Size: {labelConfig.fontSize}px</label>
+                <input 
+                  type="range" min="8" max="24" 
+                  value={labelConfig.fontSize} 
+                  onChange={e => setLabelConfig(prev => ({ ...prev, fontSize: parseInt(e.target.value) }))} 
+                />
+              </div>
+              <div className="setting-control">
+                <label>
+                  <input 
+                    type="checkbox" 
+                    checked={labelConfig.fontWeight === 'bold'} 
+                    onChange={e => setLabelConfig(prev => ({ ...prev, fontWeight: e.target.checked ? 'bold' : 'normal' }))} 
+                  /> 
+                  Bold Labels
+                </label>
+              </div>
+              <div className="setting-control">
+                <label>
+                  <input 
+                    type="checkbox" 
+                    checked={labelConfig.glow} 
+                    onChange={e => setLabelConfig(prev => ({ ...prev, glow: e.target.checked }))} 
+                  /> 
+                  Text Glow Effect
+                </label>
+              </div>
+              <div className="setting-control">
+                <label>
+                  <input 
+                    type="checkbox" 
+                    checked={labelConfig.uppercase} 
+                    onChange={e => setLabelConfig(prev => ({ ...prev, uppercase: e.target.checked }))} 
+                  /> 
+                  Uppercase
+                </label>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {selectedNode && (
           <TaxonPanel 
             node={selectedNode} 
             onClose={() => { setSelectedNode(null); setLineage([]) }}

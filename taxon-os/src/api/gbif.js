@@ -109,3 +109,29 @@ export async function fetchYearlyOccurrences(taxonKey) {
       .sort((a, b) => a.year - b.year)
   } catch { return [] }
 }
+
+/**
+ * Fetches up to 3 representative images for a clade/taxon
+ * used for visual clusters in the tree.
+ */
+export async function fetchCladeImagery(taxonName) {
+  try {
+    // We search by name to get better variety and handles cases where we don't have usageKey yet
+    const res = await fetch(`${BASE}/occurrence/search?scientificName=${encodeURIComponent(taxonName)}&mediaType=StillImage&limit=6`)
+    if (!res.ok) return []
+    const data = await res.json()
+    const images = []
+    const seenUrls = new Set()
+    
+    for (const occ of data.results || []) {
+      for (const media of occ.media || []) {
+        if (media.type === 'StillImage' && media.identifier && !seenUrls.has(media.identifier)) {
+          images.push(media.identifier)
+          seenUrls.add(media.identifier)
+          if (images.length >= 3) return images
+        }
+      }
+    }
+    return images
+  } catch { return [] }
+}

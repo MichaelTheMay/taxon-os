@@ -54,6 +54,9 @@ export default function TreeCanvas({
   selectedNodeId, 
   compareNodes = [], 
   mrcaInfo = null,
+  cladeMetaData = {},
+  nodeIcons = {},
+  labelConfig = { fontSize: 12, fontWeight: 'normal', glow: true, uppercase: false, visible: true },
   onNodeSelect, 
   onNodeExpand, 
   onNodeCollapse 
@@ -139,264 +142,174 @@ export default function TreeCanvas({
         `)
     }
 
-    const hideTooltip = () => tooltip.style('opacity', 0)
+    const hideTooltip = () => tooltip.style.opacity = 0
+
+    // ── Clade Halos (Visual Clusters) ──────────────────────────
+    const haloLayer = g.selectAll('.clade-halo')
+      .data(Object.keys(cladeMetaData).map(id => {
+        const d3Node = root.descendants().find(d => d.data.id === id)
+        if (!d3Node || !d3Node.children) return null
+        const leaves = d3Node.leaves()
+        const xMin = d3.min(leaves, d => d.x)
+        const xMax = d3.max(leaves, d => d.x)
+        const yMax = d3.max(leaves, d => d.y)
+        return { 
+          id, 
+          node: d3Node, 
+          x0: xMin, x1: xMax, 
+          y0: d3Node.y, y1: yMax + 40,
+          meta: cladeMetaData[id]
+        }
+      }).filter(Boolean), d => d.id)
+
+    haloLayer.exit().transition().duration(400).attr('opacity', 0).remove()
+
+    const haloEnter = haloLayer.enter().append('g').attr('class', 'clade-halo').attr('opacity', 0)
+    
+    haloEnter.append('path')
+      .attr('class', 'halo-path')
+      .attr('d', d3.arc()
+        .startAngle(d => d.x0)
+        .endAngle(d => d.x1)
+        .innerRadius(d => d.y0 - 20)
+        .outerRadius(d => d.y1)
+        .padAngle(0.01)
+        .cornerRadius(12)
+      )
+      .attr('fill', d => colorMapRef.current[d.id] || '#00FFD4')
+      .attr('opacity', 0.1)
+
+    // Clade Title
+    haloEnter.append('text')
+      .attr('class', 'halo-title')
+      .attr('text-anchor', 'middle')
+      .attr('dy', -12)
+      .append('textPath')
+      .attr('xlink:href', d => {
+        const pathId = `arcpath-${d.id.replace(/\W/g, '')}`
+        if (!svg.select(`#${pathId}`).node()) {
+          svg.select('defs').append('path')
+            .attr('id', pathId)
+            .attr('d', d3.arc()({
+              startAngle: d.x0, 
+              endAngle: d.x1, 
+              innerRadius: d.y1 + 10, 
+              outerRadius: d.y1 + 10
+            }))
+        }
+        return `#${pathId}`
+      })
+      .attr('startOffset', '50%')
+      .text(d => d.meta.name)
+
+    // Representative Images
+    haloEnter.selectAll('.halo-img')
+      .data(d => (d.meta.images || []).slice(0, 3).map((url, i) => ({ url, i, halo: d })))
+      .enter().append('image')
+      .attr('class', 'halo-img')
+      .attr('xlink:href', d => d.url)
+      .attr('width', 44).attr('height', 44)
+      .attr('x', d => {
+        const angle = d.halo.x0 + (d.halo.x1 - d.halo.x0) * (d.i / 2)
+        return radialPoint(angle, d.halo.y1 + 15)[0] - 22
+      })
+      .attr('y', d => {
+        const angle = d.halo.x0 + (d.halo.x1 - d.halo.x0) * (d.i / 2)
+        return radialPoint(angle, d.halo.y1 + 15)[1] - 22
+      })
+      .attr('clip-path', 'circle(50%)')
+
+    haloEnter.merge(haloLayer).transition().duration(500).attr('opacity', 1)
 
     // ── Links ─────────────────────────────────────────────────────────────
     const linkGen = d3.linkRadial().angle(d => d.x).radius(d => d.y)
-
-    const links = g.selectAll('.link')
-      .data(root.links(), d => `${d.source.data.id}→${d.target.data.id}`)
-
-    links.exit().transition().duration(300).attr('opacity', 0).remove()
+    const links = g.selectAll('.link').data(root.links(), d => `${d.source.data.id}→${d.target.data.id}`)
+    links.exit().remove()
 
     links.enter().append('path')
-      .attr('class', d => {
-        const isPath = activePathNodes.has(d.target.data.id) && activePathNodes.has(d.source.data.id)
-        return `link ${d.target.data.num_tips > 1000 ? 'link-flow' : ''} ${isPath ? 'link-active-path' : ''}`
-      })
-      .attr('d', linkGen)
-      .attr('opacity', 0)
+      .attr('class', d => `link ${d.target.data.num_tips > 1000 ? 'link-flow' : ''}`)
       .merge(links)
-      .transition().duration(500)
       .attr('d', linkGen)
-      .attr('opacity', d => {
-        if (activePathNodes.has(d.target.data.id) && activePathNodes.has(d.source.data.id)) return 1
-        return d.target.data.num_tips > 100 ? 0.6 : 0.4
-      })
-      .attr('fill', 'none')
-      .attr('stroke', d => {
-        const isPath = activePathNodes.has(d.target.data.id) && activePathNodes.has(d.source.data.id)
-        if (isPath) return '#FFFFFF' // Bright path highlight
-        
-        const targetColor = colorMapRef.current[d.target.data.id] || '#00FFD4'
-        const sourceColor = colorMapRef.current[d.source.data.id] || '#00FFD4'
-        // Find if we already have a gradient for this combo
-        const gradId = `grad-${sourceColor.replace('#','')}-${targetColor.replace('#','')}`
-        if (!svg.select(`#${gradId}`).node()) {
-          svg.select('defs').append('linearGradient')
-            .attr('id', gradId)
-            .attr('gradientUnits', 'userSpaceOnUse')
-            .attr('x1', radialPoint(d.source.x, d.source.y)[0])
-            .attr('y1', radialPoint(d.source.y, d.source.y)[1])
-            .attr('x2', radialPoint(d.target.x, d.target.y)[0])
-            .attr('y2', radialPoint(d.target.x, d.target.y)[1])
-            .selectAll('stop')
-            .data([{offset: '0%', color: sourceColor}, {offset: '100%', color: targetColor}])
-            .enter().append('stop')
-            .attr('offset', s => s.offset)
-            .attr('stop-color', s => s.color)
-        }
-        return targetColor // For now using target color as fallback/base
-      })
-      .attr('stroke-width', d => {
-        const tips = d.target.data.num_tips || 1
-        return Math.max(0.6, Math.min(4, Math.log10(tips + 1) * 0.8))
-      })
+      .attr('stroke', d => colorMapRef.current[d.target.data.id] || '#64748B')
+      .attr('stroke-width', d => Math.max(0.6, Math.min(3, Math.log10(d.target.data.num_tips || 1))))
+      .attr('opacity', 0.4)
 
-    // ── Nodes ─────────────────────────────────────────────────────────────
-    const nodes = g.selectAll('.node')
-      .data(root.descendants(), d => d.data.id)
-
-    nodes.exit().transition().duration(300).attr('opacity', 0).remove()
+    // ── Node Groups ───────────────────────────────────────────────────────
+    const nodes = g.selectAll('.node-group').data(root.descendants(), d => d.data.id)
+    nodes.exit().remove()
 
     const nodesEnter = nodes.enter().append('g')
-      .attr('class', 'node')
-      .attr('transform', d => `translate(${radialPoint(d.x, d.y)})`)
-      .attr('opacity', 0)
+      .attr('class', 'node-group')
       .style('cursor', 'pointer')
-
-    // Outer glow ring (selected)
-    nodesEnter.append('circle')
-      .attr('class', 'node-glow-ring')
-      .attr('r', 0)
-      .attr('fill', 'none')
-      .attr('stroke-width', 2)
-      .attr('opacity', 0)
-
-    // Hover aura
-    nodesEnter.append('circle')
-      .attr('class', 'node-hover-aura')
-      .attr('r', 0)
-
-    // Main circle
-    nodesEnter.append('circle')
-      .attr('class', 'node-circle')
-      .attr('r', 0)
-    
-    // Glass highlight
-    nodesEnter.append('circle')
-      .attr('class', 'node-inner-sphere')
-      .attr('r', 0)
-      .attr('pointer-events', 'none')
-      .attr('fill', 'url(#glass-gradient)')
-
-    // Expand indicator (+ for collapsed nodes with children)
-    nodesEnter.append('text')
-      .attr('class', 'node-expand-icon')
-      .attr('text-anchor', 'middle')
-      .attr('dominant-baseline', 'central')
-      .attr('pointer-events', 'none')
-
-    // Label
-    nodesEnter.append('text')
-      .attr('class', 'node-label')
-      .attr('pointer-events', 'none')
-
-    // ── Event handlers ───────────────────────────────────────────────────
-    nodesEnter
-      .on('mouseenter', (event, d) => {
-        d3.select(event.currentTarget).select('.node-circle')
-          .transition().duration(120)
-          .attr('r', nodeRadius(d.data.num_tips) * 1.5)
-        showTooltip(event, d)
-      })
-      .on('mousemove', showTooltip)
-      .on('mouseleave', (event, d) => {
-        d3.select(event.currentTarget).select('.node-circle')
-          .transition().duration(120)
-          .attr('r', nodeRadius(d.data.num_tips))
-        hideTooltip()
-      })
-      .on('click', (event, d) => {
-        event.stopPropagation()
-        // Toggle expand/collapse
+      .on('click', (e, d) => {
+        e.stopPropagation()
         if (d.data.hasChildren) {
-          if (d.data.children && d.data.children.length > 0) {
-            onNodeCollapse(d.data.id)
-          } else {
-            onNodeExpand(d.data.id)
-          }
+          if (d.data.children) onNodeCollapse(d.data.id)
+          else onNodeExpand(d.data.id)
         }
         onNodeSelect(d.data)
-        hideTooltip()
       })
 
-    // ── Merge enter + update and apply attributes ─────────────────────────
-    const allNodes = nodesEnter.merge(nodes)
+    nodesEnter.append('circle').attr('class', 'node-circle')
+    nodesEnter.append('clipPath')
+      .attr('id', d => `clip-${d.data.id.replace(/\W/g, '')}`)
+      .append('circle')
+    nodesEnter.append('image').attr('class', 'node-icon')
+    nodesEnter.append('text').attr('class', 'node-label')
 
-    allNodes.transition().duration(500)
-      .attr('transform', d => `translate(${radialPoint(d.x, d.y)})`)
-      .attr('opacity', 1)
+    const nodesAll = nodesEnter.merge(nodes)
+    nodesAll.attr('transform', d => `translate(${radialPoint(d.x, d.y)})`)
 
-    allNodes.select('.node-circle')
-      .attr('class', d => {
-        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
-        const isCompare = compares.some(c => getOtt(c.id) === getOtt(d.data.id))
-        const isMRCA = getOtt(d.data.id) === activeMRCAId
-        return `node-circle ${d.data.num_tips > 50000 ? 'node-pulse' : ''} ${isCompare ? 'node-compare-target' : ''} ${isMRCA ? 'node-mrca' : ''}`
-      })
-      .transition().duration(500)
+    nodesAll.select('.node-circle')
       .attr('r', d => nodeRadius(d.data.num_tips))
-      .attr('fill', d => {
-        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
-        if (compares.some(c => getOtt(c.id) === getOtt(d.data.id))) return '#FFF'
-        if (getOtt(d.data.id) === activeMRCAId) return '#FFEB3B'
-        return colorMapRef.current[d.data.id] || '#00FFD4'
-      })
-      .attr('stroke', d => d.data.id === selectedId ? '#fff' : 'rgba(255,255,255,0.4)')
-      .attr('stroke-width', d => {
-        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
-        if (d.data.id === selectedId) return 2.5
-        if (compares.some(c => getOtt(c.id) === getOtt(d.data.id))) return 3
-        if (getOtt(d.data.id) === activeMRCAId) return 4
-        if (['kingdom', 'phylum', 'class'].includes(d.data.rank)) return 1.5
-        return 0.8
-      })
-      .attr('filter', d => {
-        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
-        if (d.data.id === selectedId || compares.some(c => getOtt(c.id) === getOtt(d.data.id))) return 'url(#strong-glow)'
-        return d.data.num_tips > 1000 ? 'url(#glow)' : 'url(#node-inner-glow)'
-      })
+      .attr('fill', d => d.data.id === selectedId ? '#fff' : colorMapRef.current[d.data.id])
+      .attr('opacity', d => nodeIcons[d.data.id] ? 0.2 : 1)
+      .attr('stroke', d => d.data.id === selectedId ? '#fff' : 'rgba(255,255,255,0.2)')
+      .attr('stroke-width', d => d.data.id === selectedId ? 2 : 1)
 
-    allNodes.select('.node-inner-sphere')
-      .transition().duration(500)
-      .attr('r', d => nodeRadius(d.data.num_tips) * 0.9)
+    nodesAll.select('clipPath circle')
+      .attr('r', d => nodeRadius(d.data.num_tips))
 
-    allNodes.select('.node-glow-ring')
-      .transition().duration(300)
-      .attr('r', d => d.data.id === selectedId ? nodeRadius(d.data.num_tips) + 6 : 0)
-      .attr('stroke', d => colorMapRef.current[d.data.id] || '#00FFD4')
-      .attr('opacity', d => d.data.id === selectedId ? 0.7 : 0)
+    nodesAll.select('.node-icon')
+      .attr('xlink:href', d => nodeIcons[d.data.id] || '')
+      .attr('x', d => -nodeRadius(d.data.num_tips))
+      .attr('y', d => -nodeRadius(d.data.num_tips))
+      .attr('width', d => nodeRadius(d.data.num_tips) * 2)
+      .attr('height', d => nodeRadius(d.data.num_tips) * 2)
+      .attr('clip-path', d => `url(#clip-${d.data.id.replace(/\W/g, '')})`)
+      .attr('opacity', d => nodeIcons[d.data.id] || 0)
 
-    allNodes.select('.node-expand-icon')
-      .attr('font-size', '8px')
-      .attr('fill', 'rgba(255,255,255,0.7)')
-      .attr('dy', '0.1em')
+    nodesAll.select('.node-label')
       .text(d => {
-        if (d.data._loading) return '…'
-        if (d.data.hasChildren && (!d.data.children || d.data.children.length === 0)) return '+'
+        if (d.depth < 2 || d.data.id === selectedId || d.data.num_tips > 1000) return d.data.name
         return ''
       })
-
-    // Labels: only show for significant clades or top levels
-    allNodes.select('.node-label')
       .attr('dy', '0.31em')
-      .attr('font-size', d => {
-        if (d.depth === 0) return '13px'
-        if (d.depth === 1) return '11px'
-        if (d.data.num_tips > 10000) return '10px'
-        if (d.data.num_tips > 1000) return '9px'
-        return '8px'
-      })
-      .attr('font-weight', d => d.depth <= 1 ? '600' : '400')
-      .attr('fill', d => {
-        if (d.data.id === selectedId) return '#fff'
-        if (d.depth === 0) return '#fff'
-        return colorMapRef.current[d.data.id] || '#94a3b8'
-      })
-      .attr('opacity', d => {
-        if (d.depth <= 1) return 1
-        if (d.data.num_tips > 5000) return 0.9
-        if (d.data.num_tips > 500) return 0.7
-        return 0.5
-      })
-      .attr('x', d => {
-        if (d.depth === 0) return nodeRadius(d.data.num_tips) + 6
-        return d.x < Math.PI ? nodeRadius(d.data.num_tips) + 5 : -(nodeRadius(d.data.num_tips) + 5)
-      })
-      .attr('text-anchor', d => {
-        if (d.depth === 0) return 'start'
-        return d.x < Math.PI ? 'start' : 'end'
-      })
-      .attr('transform', d => {
-        if (d.depth === 0) return null
-        // Convert radial angle to degrees for text rotation
-        const angle = (d.x * 180 / Math.PI) - 90
-        if (d.x >= Math.PI) {
-          return `rotate(${angle + 180})`
-        }
-        return `rotate(${angle})`
-      })
-      .text(d => {
-        if (d.depth === 0) return d.data.name
-        if (d.depth === 1) return d.data.name
-        if (d.data.num_tips > 1000) return d.data.name
-        if (d.data.id === selectedId) return d.data.name
-        if (['kingdom', 'phylum', 'order'].includes(d.data.rank)) return d.data.name
-        return d.data.num_tips > 100 ? d.data.name : ''
-      })
+      .attr('x', d => d.x < Math.PI ? 10 : -10)
+      .attr('text-anchor', d => d.x < Math.PI ? 'start' : 'end')
+      .attr('transform', d => d.x >= Math.PI ? 'rotate(180)' : null)
+      .style('font-size', `${labelConfig.fontSize}px`)
+      .style('font-weight', labelConfig.fontWeight)
+      .style('text-transform', labelConfig.uppercase ? 'uppercase' : 'none')
+      .style('display', labelConfig.visible ? 'block' : 'none')
+      .style('text-shadow', labelConfig.glow ? '0 0 5px rgba(255,255,255,0.7)' : 'none')
+      .attr('fill', '#fff')
 
-    // ── Auto-center on selection ─────────────────────────────────────────
+    // ── Auto-center ──
     if (selectedId) {
-      setTimeout(() => {
-        const selectedNode = allNodes.filter(d => d.data.id === selectedId).node()
-        if (selectedNode) {
-          const d = d3.select(selectedNode).datum()
-          const [tx, ty] = radialPoint(d.x, d.y)
-          const { width, height } = svgRef.current.getBoundingClientRect()
-          
-          svg.transition().duration(1000).call(
-            zoomRef.current.transform,
-            d3.zoomIdentity.translate(width / 2 - tx * 1.5, height / 2 - ty * 1.5).scale(1.5)
-          )
-        }
-      }, 100)
+      const d = root.descendants().find(d => d.data.id === selectedId)
+      if (d) {
+        const [tx, ty] = radialPoint(d.x, d.y)
+        const { width, height } = svgRef.current.getBoundingClientRect()
+        svg.transition().duration(800).call(
+          zoomRef.current.transform,
+          d3.zoomIdentity.translate(width/2 - tx, height/2 - ty).scale(1.2)
+        )
+      }
     }
 
-    // ── Click on background to deselect ──────────────────────────────────
     svg.on('click', () => onNodeSelect(null))
-
-  }, [onNodeSelect, onNodeExpand, onNodeCollapse])
+  }, [onNodeSelect, onNodeExpand, onNodeCollapse, cladeMetaData, nodeIcons, labelConfig])
 
   // Keep ref always pointing at latest renderTree
   renderTreeRef.current = renderTree

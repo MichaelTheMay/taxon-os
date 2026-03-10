@@ -36,6 +36,11 @@ export default function App() {
   // Phylogenetic Compare Mode
   const [compareNodes,  setCompareNodes]  = useState([]) // [Node1, Node2]
   const [mrcaInfo,      setMrcaInfo]      = useState(null)
+  
+  // Recursive Expansion state
+  const [expandingNode, setExpandingNode] = useState(null) // ID of current root of recursion
+  const [isAborting,   setIsAborting]   = useState(false)
+  const [abortController, setAbortController] = useState(null)
 
   // ── Initialize tree on load ──────────────────────────────────────────────
   useEffect(() => {
@@ -138,6 +143,52 @@ export default function App() {
   // ── Collapse a node ──────────────────────────────────────────────────────
   const collapseNode = useCallback((nodeId) => {
     setTree(prev => updateNode(prev, nodeId, { children: null }))
+  }, [])
+
+  // ── Recursive Expansion ────────────────────────────────────────────────────
+  const stopExpansion = () => setIsAborting(true)
+
+  const expandRecursively = useCallback(async (nodeId, maxNodes = 50) => {
+    setExpandingNode(nodeId)
+    setIsAborting(false)
+    let count = 0
+    let queue = [nodeId]
+    
+    while (queue.length > 0 && count < maxNodes) {
+      // Check for user cancellation
+      // We check a local flag because the state update might be slow
+      if (window._abortExpansion) {
+        window._abortExpansion = false
+        break
+      }
+
+      const currentId = queue.shift()
+      // Skip if already expanded? Usually better to just try or check state
+      
+      try {
+        const children = await fetchChildren(currentId)
+        if (children && children.length > 0) {
+          const childNodes = children.map(c => ({
+            id: c.id,
+            name: c.name, rank: c.rank, num_tips: c.num_tips,
+            hasChildren: c.num_tips > 1, children: null, _loading: false, ott_id: c.ott_id,
+          }))
+
+          setTree(prev => updateNode(prev, currentId, { children: childNodes }))
+          setTotalExpanded(n => n + 1)
+          count++
+
+          // Add meaningful children to queue (limit to 3 levels deep or specific count)
+          // We only queue if they have children and aren't leaves
+          const toAdd = childNodes.filter(c => c.hasChildren).map(c => c.id)
+          queue.push(...toAdd)
+        }
+      } catch (e) { console.warn('Child fetch in recursion failed', e) }
+
+      // "Max speed so as to not crash" -> tiny delay for event loop
+      await new Promise(r => setTimeout(r, 40)) 
+    }
+    setExpandingNode(null)
   }, [])
 
   // ── Handle node selection ──────────────────────────────────────────────────
@@ -373,13 +424,16 @@ export default function App() {
         )}
 
         {selectedNode && (
-          <TaxonPanel
-            node={selectedNode}
-            compareMode={compareNodes.length === 1}
-            isComparing={compareNodes.some(n => n.ott_id === selectedNode.ott_id)}
+          <TaxonPanel 
+            node={selectedNode} 
             onClose={() => { setSelectedNode(null); setLineage([]) }}
             onNavigate={handleNavigate}
             onCompare={() => handleCompareTrigger(selectedNode)}
+            compareMode={!!compareNodes.length}
+            isComparing={compareNodes.some(n => n.id === selectedNode?.id)}
+            onRecursiveExpand={expandRecursively}
+            expandingNode={expandingNode}
+            onStopExpansion={() => { window._abortExpansion = true; setExpandingNode(null); }}
           />
         )}
       </main>

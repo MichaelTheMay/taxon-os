@@ -1258,3 +1258,49 @@ html, body, #root {
 .common-name-tag { background: rgba(0,255,212,0.08); border: 1px solid rgba(0,255,212,0.18); color: var(--accent); font-size: 12px; padding: 3px 10px; border-radius: 20px; }
 .no-data-msg { color: var(--text-mid); font-size: 12px; font-style: italic; padding: 8px 4px; }
 
+/* ── Recursive Expansion ───────────────────────────────────────── */
+.expansion-offer {
+  margin: 15px 0;
+  padding: 12px;
+  background: rgba(0, 255, 212, 0.05);
+  border: 1px dashed var(--accent-dim);
+  border-radius: var(--radius);
+  text-align: center;
+}
+.recursive-btn {
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.recursive-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+  box-shadow: 0 0 15px var(--accent-glow);
+}
+.expansion-active {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+}
+.stop-btn {
+  background: rgba(255, 107, 53, 0.2);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 11px;
+  margin-left: 10px;
+  cursor: pointer;
+}
+.stop-btn:hover { background: var(--danger); color: white; }
+

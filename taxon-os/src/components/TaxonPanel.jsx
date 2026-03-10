@@ -18,8 +18,12 @@ const TABS = [
   { id: 'gallery', label: 'Gallery',  icon: '📷' },
 ]
 
-export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compareMode, isComparing }) {
+export default function TaxonPanel({ 
+  node, onClose, onNavigate, onCompare, compareMode, isComparing,
+  onRecursiveExpand, expandingNode, onStopExpansion 
+}) {
   const [tab, setTab] = useState('overview')
+  // ... (rest of states)
   const [wiki, setWiki] = useState(null)
   const [images, setImages] = useState([])
   const [gbif, setGbif] = useState(null)
@@ -228,6 +232,27 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
               {occCount != null && <Stat value={fmtNum(occCount)} label="GBIF records" />}
               {inat?.observations_count != null && <Stat value={fmtNum(inat.observations_count)} label="iNat obs." />}
             </div>
+
+            {/* Recursive Expand Option */}
+            {node.num_tips > 1 && !node.children && (
+              <div className="expansion-offer">
+                {expandingNode === node.id ? (
+                  <div className="expansion-active">
+                    <div className="nav-spinner" />
+                    <span>Expanding {fmtNum(node.num_tips)} nodes...</span>
+                    <button className="stop-btn" onClick={onStopExpansion}>Stop</button>
+                  </div>
+                ) : (
+                  <button 
+                    className="recursive-btn" 
+                    onClick={() => onRecursiveExpand(node.id)}
+                    title="Automatically expand all branches in this clade at max speed"
+                  >
+                    🚀 Recursive Expand ({fmtNum(node.num_tips)} nodes)
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Sparkline */}
             {yearlyData.length > 5 && (

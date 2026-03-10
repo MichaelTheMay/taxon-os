@@ -28,19 +28,37 @@ export async function matchNames(names) {
 }
 
 export async function fetchChildren(nodeId) {
-  const data = await post('/tree_of_life/children', { node_id: nodeId })
-  return (data.children || [])
-    .filter(c => c.taxon?.name && !c.node_id?.startsWith('mrca'))
-    .sort((a, b) => (b.num_tips || 0) - (a.num_tips || 0))
-    .slice(0, 50)
-    .map(c => ({
-      id: `ott${c.taxon.ott_id}`,
-      node_id: c.node_id || `ott${c.taxon.ott_id}`,
-      name: c.taxon.name,
-      rank: c.taxon.rank || 'no rank',
-      num_tips: c.num_tips || 1,
-      ott_id: c.taxon.ott_id,
-    }))
+  const ottId = parseInt(nodeId.replace(/^ott/, ''), 10)
+  if (isNaN(ottId)) return []
+  
+  // 1. Get taxonomic children
+  const taxData = await post('/taxonomy/taxon_info', { ott_id: ottId, include_children: true }).catch(() => null)
+  if (!taxData || !taxData.children) return []
+  
+  // 2. Filter problematic or extinct clades to keep the tree clean
+  let children = taxData.children.filter(c => {
+    const hidden = c.flags?.some(f => ['incertae_sedis', 'unplaced', 'viral', 'extinct', 'barren', 'hidden'].includes(f))
+    return !hidden
+  })
+  
+  // Limit to top 30 to avoid hammering the API
+  children = children.slice(0, 30)
+  
+  // 3. Look up synthetic tree info for the children to get the correct branch sizes (num_tips)
+  const nodes = await Promise.all(children.map(async c => {
+    const nInfo = await post('/tree_of_life/node_info', { node_id: `ott${c.ott_id}` }).catch(() => null)
+    return {
+      id: `ott${c.ott_id}`,
+      node_id: `ott${c.ott_id}`,
+      name: c.name,
+      rank: c.rank || 'no rank',
+      num_tips: nInfo?.num_tips || 1,
+      ott_id: c.ott_id,
+    }
+  }))
+  
+  // 4. Return sorted by tip count (biggest clades first)
+  return nodes.sort((a, b) => b.num_tips - a.num_tips)
 }
 
 export async function fetchNodeInfo(nodeId) {
@@ -105,4 +123,8 @@ export async function fetchRandomTaxon() {
   const name = SURPRISE_TAXA[Math.floor(Math.random() * SURPRISE_TAXA.length)]
   const results = await searchTaxa(name)
   return results[0] || null
+}
+
+export async function fetchMRCA(ottIds) {
+  return post('/tree_of_life/mrca', { ott_ids: ottIds })
 }

@@ -49,7 +49,15 @@ function buildColorMap(hierarchyRoot) {
 }
 
 // ── Main Component ─────────────────────────────────────────────────────────
-export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onNodeExpand, onNodeCollapse }) {
+export default function TreeCanvas({ 
+  treeData, 
+  selectedNodeId, 
+  compareNodes = [], 
+  mrcaInfo = null,
+  onNodeSelect, 
+  onNodeExpand, 
+  onNodeCollapse 
+}) {
   const svgRef = useRef(null)
   const gRef   = useRef(null)
   const zoomRef = useRef(null)
@@ -75,13 +83,11 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
     return () => svg.on('.zoom', null)
   }, [])
 
-  // ── Re-render when data changes ───────────────────────────────────────────
-  useEffect(() => {
-    if (!treeData || !gRef.current || !svgRef.current) return
-    renderTree(treeData, selectedNodeId)
-  }, [treeData, selectedNodeId]) // eslint-disable-line
+  // renderTree defined below; we call it via renderTreeRef so the effect always uses latest version
 
-  const renderTree = useCallback((data, selectedId) => {
+  const renderTreeRef = useRef(null)
+
+  const renderTree = useCallback((data, selectedId, compares, mrca) => {
     const g = d3.select(gRef.current)
     const svg = d3.select(svgRef.current)
 
@@ -97,6 +103,27 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
 
     // Build color map
     colorMapRef.current = buildColorMap(root)
+
+    // Calculate paths for MRCA (Addition #5)
+    let activePathNodes = new Set()
+    let activeMRCAId = null
+    
+    if (compares.length === 2 && mrca) {
+      const getOtt = id => String(id).replace(/^(ott|life-)/, '')
+      activeMRCAId = getOtt(mrca.mrca?.node_id)
+      
+      compares.forEach(target => {
+        const d3Node = root.descendants().find(d => getOtt(d.data.id) === getOtt(target.id))
+        if (d3Node) {
+          let curr = d3Node
+          while (curr) {
+            activePathNodes.add(curr.data.id)
+            if (getOtt(curr.data.id) === activeMRCAId) break
+            curr = curr.parent
+          }
+        }
+      })
+    }
 
     // ── Tooltip helpers ──────────────────────────────────────────────────
     const tooltip = d3.select(tooltipRef.current)
@@ -123,18 +150,47 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
     links.exit().transition().duration(300).attr('opacity', 0).remove()
 
     links.enter().append('path')
-      .attr('class', 'link')
+      .attr('class', d => {
+        const isPath = activePathNodes.has(d.target.data.id) && activePathNodes.has(d.source.data.id)
+        return `link ${d.target.data.num_tips > 1000 ? 'link-flow' : ''} ${isPath ? 'link-active-path' : ''}`
+      })
       .attr('d', linkGen)
       .attr('opacity', 0)
       .merge(links)
       .transition().duration(500)
       .attr('d', linkGen)
-      .attr('opacity', 0.35)
+      .attr('opacity', d => {
+        if (activePathNodes.has(d.target.data.id) && activePathNodes.has(d.source.data.id)) return 1
+        return d.target.data.num_tips > 100 ? 0.6 : 0.4
+      })
       .attr('fill', 'none')
-      .attr('stroke', d => colorMapRef.current[d.target.data.id] || '#00FFD4')
+      .attr('stroke', d => {
+        const isPath = activePathNodes.has(d.target.data.id) && activePathNodes.has(d.source.data.id)
+        if (isPath) return '#FFFFFF' // Bright path highlight
+        
+        const targetColor = colorMapRef.current[d.target.data.id] || '#00FFD4'
+        const sourceColor = colorMapRef.current[d.source.data.id] || '#00FFD4'
+        // Find if we already have a gradient for this combo
+        const gradId = `grad-${sourceColor.replace('#','')}-${targetColor.replace('#','')}`
+        if (!svg.select(`#${gradId}`).node()) {
+          svg.select('defs').append('linearGradient')
+            .attr('id', gradId)
+            .attr('gradientUnits', 'userSpaceOnUse')
+            .attr('x1', radialPoint(d.source.x, d.source.y)[0])
+            .attr('y1', radialPoint(d.source.y, d.source.y)[1])
+            .attr('x2', radialPoint(d.target.x, d.target.y)[0])
+            .attr('y2', radialPoint(d.target.x, d.target.y)[1])
+            .selectAll('stop')
+            .data([{offset: '0%', color: sourceColor}, {offset: '100%', color: targetColor}])
+            .enter().append('stop')
+            .attr('offset', s => s.offset)
+            .attr('stop-color', s => s.color)
+        }
+        return targetColor // For now using target color as fallback/base
+      })
       .attr('stroke-width', d => {
         const tips = d.target.data.num_tips || 1
-        return Math.max(0.4, Math.min(2.5, Math.log10(tips + 1) * 0.5))
+        return Math.max(0.6, Math.min(4, Math.log10(tips + 1) * 0.8))
       })
 
     // ── Nodes ─────────────────────────────────────────────────────────────
@@ -157,10 +213,22 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
       .attr('stroke-width', 2)
       .attr('opacity', 0)
 
+    // Hover aura
+    nodesEnter.append('circle')
+      .attr('class', 'node-hover-aura')
+      .attr('r', 0)
+
     // Main circle
     nodesEnter.append('circle')
       .attr('class', 'node-circle')
       .attr('r', 0)
+    
+    // Glass highlight
+    nodesEnter.append('circle')
+      .attr('class', 'node-inner-sphere')
+      .attr('r', 0)
+      .attr('pointer-events', 'none')
+      .attr('fill', 'url(#glass-gradient)')
 
     // Expand indicator (+ for collapsed nodes with children)
     nodesEnter.append('text')
@@ -211,12 +279,38 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
       .attr('opacity', 1)
 
     allNodes.select('.node-circle')
+      .attr('class', d => {
+        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
+        const isCompare = compares.some(c => getOtt(c.id) === getOtt(d.data.id))
+        const isMRCA = getOtt(d.data.id) === activeMRCAId
+        return `node-circle ${d.data.num_tips > 50000 ? 'node-pulse' : ''} ${isCompare ? 'node-compare-target' : ''} ${isMRCA ? 'node-mrca' : ''}`
+      })
       .transition().duration(500)
       .attr('r', d => nodeRadius(d.data.num_tips))
-      .attr('fill', d => colorMapRef.current[d.data.id] || '#00FFD4')
-      .attr('stroke', d => d.data.id === selectedId ? '#fff' : 'rgba(255,255,255,0.25)')
-      .attr('stroke-width', d => d.data.id === selectedId ? 2 : 0.8)
-      .attr('filter', d => d.data.num_tips > 1000 ? 'url(#glow)' : null)
+      .attr('fill', d => {
+        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
+        if (compares.some(c => getOtt(c.id) === getOtt(d.data.id))) return '#FFF'
+        if (getOtt(d.data.id) === activeMRCAId) return '#FFEB3B'
+        return colorMapRef.current[d.data.id] || '#00FFD4'
+      })
+      .attr('stroke', d => d.data.id === selectedId ? '#fff' : 'rgba(255,255,255,0.4)')
+      .attr('stroke-width', d => {
+        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
+        if (d.data.id === selectedId) return 2.5
+        if (compares.some(c => getOtt(c.id) === getOtt(d.data.id))) return 3
+        if (getOtt(d.data.id) === activeMRCAId) return 4
+        if (['kingdom', 'phylum', 'class'].includes(d.data.rank)) return 1.5
+        return 0.8
+      })
+      .attr('filter', d => {
+        const getOtt = id => String(id).replace(/^(ott|life-)/, '')
+        if (d.data.id === selectedId || compares.some(c => getOtt(c.id) === getOtt(d.data.id))) return 'url(#strong-glow)'
+        return d.data.num_tips > 1000 ? 'url(#glow)' : 'url(#node-inner-glow)'
+      })
+
+    allNodes.select('.node-inner-sphere')
+      .transition().duration(500)
+      .attr('r', d => nodeRadius(d.data.num_tips) * 0.9)
 
     allNodes.select('.node-glow-ring')
       .transition().duration(300)
@@ -278,13 +372,40 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
         if (d.depth === 1) return d.data.name
         if (d.data.num_tips > 1000) return d.data.name
         if (d.data.id === selectedId) return d.data.name
+        if (['kingdom', 'phylum', 'order'].includes(d.data.rank)) return d.data.name
         return d.data.num_tips > 100 ? d.data.name : ''
       })
+
+    // ── Auto-center on selection ─────────────────────────────────────────
+    if (selectedId) {
+      setTimeout(() => {
+        const selectedNode = allNodes.filter(d => d.data.id === selectedId).node()
+        if (selectedNode) {
+          const d = d3.select(selectedNode).datum()
+          const [tx, ty] = radialPoint(d.x, d.y)
+          const { width, height } = svgRef.current.getBoundingClientRect()
+          
+          svg.transition().duration(1000).call(
+            zoomRef.current.transform,
+            d3.zoomIdentity.translate(width / 2 - tx * 1.5, height / 2 - ty * 1.5).scale(1.5)
+          )
+        }
+      }, 100)
+    }
 
     // ── Click on background to deselect ──────────────────────────────────
     svg.on('click', () => onNodeSelect(null))
 
   }, [onNodeSelect, onNodeExpand, onNodeCollapse])
+
+  // Keep ref always pointing at latest renderTree
+  renderTreeRef.current = renderTree
+
+  // ── Re-render ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!treeData || !gRef.current || !svgRef.current) return
+    renderTreeRef.current(treeData, selectedNodeId, compareNodes, mrcaInfo)
+  }, [treeData, selectedNodeId, compareNodes, mrcaInfo]) // eslint-disable-line
 
   return (
     <div className="tree-canvas-wrap">
@@ -322,10 +443,72 @@ export default function TreeCanvas({ treeData, selectedNodeId, onNodeSelect, onN
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
+          <filter id="node-inner-glow">
+            <feComponentTransfer in="SourceAlpha">
+              <feFuncA type="table" tableValues="1 0" />
+            </feComponentTransfer>
+            <feGaussianBlur stdDeviation="1.5" />
+            <feOffset dx="0.5" dy="0.5" result="offsetblur" />
+            <feFlood floodColor="white" floodOpacity="0.4" result="color" />
+            <feComposite in2="offsetblur" operator="in" />
+            <feComposite in2="SourceAlpha" operator="in" />
+            <feMerge>
+              <feMergeNode in="SourceGraphic" />
+              <feMergeNode />
+            </feMerge>
+          </filter>
           <radialGradient id="bg-gradient">
-            <stop offset="0%" stopColor="#0a1628" />
+            <stop offset="0%" stopColor="#0d1930" />
             <stop offset="100%" stopColor="#020812" />
           </radialGradient>
+
+          <radialGradient id="glass-gradient" cx="30%" cy="30%" r="70%">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.4)" />
+            <stop offset="50%" stopColor="transparent" />
+            <stop offset="100%" stopColor="rgba(0,0,0,0.2)" />
+          </radialGradient>
+
+          <filter id="aura">
+            <feGaussianBlur stdDeviation="4" result="blur" />
+            <feComposite in="SourceGraphic" in2="blur" operator="over" />
+          </filter>
+
+          {/* Dynamic Link Gradients will be added here via JS */}
+          <style>
+            {`
+              .link {
+                transition: stroke 0.8s, stroke-width 0.8s, opacity 0.8s;
+                stroke-linecap: round;
+              }
+              .link-flow {
+                stroke-dasharray: 6, 12;
+                animation: flow 15s linear infinite;
+              }
+              @keyframes flow {
+                from { stroke-dashoffset: 120; }
+                to { stroke-dashoffset: 0; }
+              }
+              .node-pulse {
+                animation: node-pulse-anim 4s ease-in-out infinite;
+              }
+              @keyframes node-pulse-anim {
+                0%, 100% { transform: scale(1); filter: brightness(1) drop-shadow(0 0 5px currentColor); }
+                50% { transform: scale(1.15); filter: brightness(1.4) drop-shadow(0 0 15px currentColor); }
+              }
+              .node-hover-aura {
+                fill: none;
+                stroke: currentColor;
+                stroke-width: 1;
+                filter: url(#aura);
+                opacity: 0;
+                transition: opacity 0.3s, r 0.3s;
+              }
+              .node:hover .node-hover-aura {
+                opacity: 0.5;
+                r: 25;
+              }
+            `}
+          </style>
         </defs>
         <rect width="100%" height="100%" fill="url(#bg-gradient)" />
         <g ref={gRef} />

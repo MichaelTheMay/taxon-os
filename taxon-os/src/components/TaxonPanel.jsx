@@ -4,15 +4,19 @@ import { matchGBIF, fetchOccurrenceImages, fetchOccurrenceCount, fetchOccurrence
 import { fetchInatTaxon, fetchInatObservations } from '../api/inaturalist'
 import { fetchLineage } from '../api/otl'
 import { getIUCNColor, getIUCNLabel } from '../api/iucn'
+import { fetchWikidataQuickFacts } from '../api/wikidata'
+import { fetchEOLData } from '../api/eol'
+import { fetchXCRecordings } from '../api/xenocanto'
 import OccurrenceMap from './OccurrenceMap'
 
 const TABS = [
   { id: 'overview', label: 'Overview', icon: '📋' },
+  { id: 'facts',   label: 'Facts',    icon: '🔬' },
   { id: 'map',     label: 'Map',      icon: '🗺️' },
   { id: 'gallery', label: 'Gallery',  icon: '📷' },
 ]
 
-export default function TaxonPanel({ node, onClose, onNavigate }) {
+export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compareMode, isComparing }) {
   const [tab, setTab] = useState('overview')
   const [wiki, setWiki] = useState(null)
   const [images, setImages] = useState([])
@@ -28,6 +32,13 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
   const [loading, setLoading] = useState(false)
   const [activeImg, setActiveImg] = useState(0)
   const [lightbox, setLightbox] = useState(null)
+  
+  // New data sources
+  const [wikidata, setWikidata] = useState(null)
+  const [eol, setEol] = useState(null)
+  const [xcRecordings, setXcRecordings] = useState([])
+  const [audioPlaying, setAudioPlaying] = useState(null) // {id, audio}
+  
   const panelRef = useRef(null)
 
   useEffect(() => {
@@ -42,6 +53,8 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
     setWiki(null); setImages([]); setGbif(null); setInat(null)
     setOccCount(null); setOccPoints([]); setProfile(null)
     setYearlyData([]); setLineage([]); setInatObs([])
+    setWikidata(null); setEol(null); setXcRecordings([])
+    if (audioPlaying) { audioPlaying.audio?.pause(); setAudioPlaying(null) }
 
     const name = node.name
 
@@ -81,6 +94,17 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
       setInatObs(obsRes)
     }
 
+    // Phase 4: New data sources (non-blocking, run in background)
+    Promise.allSettled([
+      fetchWikidataQuickFacts(name),
+      fetchEOLData(name),
+      fetchXCRecordings(name, 5),
+    ]).then(([wdRes, eolRes, xcRes]) => {
+      if (wdRes.status === 'fulfilled') setWikidata(wdRes.value)
+      if (eolRes.status === 'fulfilled') setEol(eolRes.value)
+      if (xcRes.status === 'fulfilled') setXcRecordings(xcRes.value)
+    })
+
     setLoading(false)
   }
 
@@ -109,9 +133,10 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
   const wikiUrl = wiki?.content_urls?.desktop?.page
   const gbifUrl = gbif?.usageKey ? `https://www.gbif.org/species/${gbif.usageKey}` : null
   const inatUrl = inat?.id ? `https://www.inaturalist.org/taxa/${inat.id}` : null
+  const pbdbUrl = `https://paleobiodb.org/classic/checkTaxonInfo?taxon_name=${encodeURIComponent(node.name)}`
 
   return (
-    <aside className="taxon-panel" ref={panelRef}>
+    <aside className={`taxon-panel ${loading ? 'loading' : ''}`} ref={panelRef}>
       <button className="panel-close" onClick={onClose}>✕</button>
 
       {/* Hero image */}
@@ -126,6 +151,19 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
           </div>
         )}
         <div className="hero-gradient" />
+        
+        <div className="panel-actions">
+           {onCompare && (
+             <button 
+               className={`action-btn compare-btn ${isComparing ? 'active' : ''}`}
+               onClick={onCompare}
+               title={compareMode ? "Select this to find MRCA" : "Start phylogenetic comparison"}
+             >
+               {isComparing ? '📍 Target' : compareMode ? '🎯 Compare' : '⚖️ Path-Finder'}
+             </button>
+           )}
+        </div>
+
         <div className="hero-meta">
           <span className="hero-rank">{node.rank}</span>
           {commonName && <span className="hero-common">{commonName}</span>}
@@ -248,6 +286,11 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
                 {wikiUrl  && <ExLink href={wikiUrl}  label="Wikipedia" icon="📖" />}
                 {gbifUrl  && <ExLink href={gbifUrl}   label="GBIF"      icon="🌍" />}
                 {inatUrl  && <ExLink href={inatUrl}   label="iNaturalist" icon="🔬" />}
+                {pbdbUrl  && <ExLink href={pbdbUrl}   label="Fossils (PBDB)" icon="🦴" />}
+                {eol?.eolUrl && <ExLink href={eol.eolUrl} label="EOL" icon="📚" />}
+                {wikidata?.wikidataId && (
+                  <ExLink href={`https://www.wikidata.org/wiki/${wikidata.wikidataId}`} label="Wikidata" icon="🔗" />
+                )}
                 {node.ott_id && (
                   <ExLink
                     href={`https://tree.opentreeoflife.org/taxonomy/browse?id=${node.ott_id}`}
@@ -256,6 +299,95 @@ export default function TaxonPanel({ node, onClose, onNavigate }) {
                 )}
               </div>
             </section>
+          </>
+        )}
+
+        {/* ─── FACTS TAB (Wikidata + Xeno-canto) ─── */}
+        {tab === 'facts' && (
+          <>
+            {/* Wikidata structured traits */}
+            {wikidata && (
+              <section className="panel-section">
+                <h3 className="section-heading">Biological Traits <span className="source-badge wd-badge">Wikidata</span></h3>
+                <div className="traits-grid">
+                  {wikidata.mass && <TraitRow icon="⚖️" label="Mass" value={wikidata.mass} />}
+                  {wikidata.lifespan && <TraitRow icon="⏳" label="Lifespan" value={wikidata.lifespan} />}
+                  {wikidata.diet && <TraitRow icon="🍃" label="Diet" value={wikidata.diet} />}
+                  {wikidata.habitat && <TraitRow icon="🏔️" label="Habitat" value={wikidata.habitat} />}
+                  {wikidata.conservationStatus && <TraitRow icon="⚠️" label="Status" value={wikidata.conservationStatus} />}
+                  {!wikidata.mass && !wikidata.lifespan && !wikidata.diet && (
+                    <p className="no-data-msg">No structured trait data available for this taxon yet.</p>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {/* Xeno-canto Audio Player */}
+            {xcRecordings.length > 0 && (
+              <section className="panel-section">
+                <h3 className="section-heading">Wildlife Recordings <span className="source-badge xc-badge">Xeno-canto</span></h3>
+                <div className="xc-recordings">
+                  {xcRecordings.map(rec => (
+                    <div key={rec.id} className={`xc-rec ${audioPlaying?.id === rec.id ? 'xc-rec-playing' : ''}`}>
+                      <button
+                        className="xc-play-btn"
+                        onClick={() => {
+                          if (audioPlaying?.id === rec.id) {
+                            audioPlaying.audio.pause()
+                            setAudioPlaying(null)
+                          } else {
+                            if (audioPlaying) audioPlaying.audio.pause()
+                            const audio = new Audio(rec.url)
+                            audio.play().catch(() => {})
+                            setAudioPlaying({ id: rec.id, audio })
+                          }
+                        }}
+                      >
+                        {audioPlaying?.id === rec.id ? '⏹' : '▶'}
+                      </button>
+                      <div className="xc-meta">
+                        <span className="xc-type">{rec.type}</span>
+                        <span className="xc-location">{rec.country} — {rec.locality || 'Unknown location'}</span>
+                        <span className="xc-quality">Quality: {rec.quality} · {rec.recordist}</span>
+                      </div>
+                      <a href={rec.pageUrl} target="_blank" rel="noopener noreferrer" className="xc-link">↗</a>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* EOL supplementary articles */}
+            {eol?.articles?.length > 0 && (
+              <section className="panel-section">
+                <h3 className="section-heading">From the Literature <span className="source-badge eol-badge">EOL</span></h3>
+                {eol.articles.map((a, i) => (
+                  <div key={i} className="eol-article">
+                    {a.type && <span className="eol-article-type">{a.type}</span>}
+                    <p className="extract-text">{truncate(a.text, 400)}</p>
+                  </div>
+                ))}
+              </section>
+            )}
+
+            {/* EOL common names */}
+            {eol?.commonNames?.length > 0 && (
+              <section className="panel-section">
+                <h3 className="section-heading">Common Names <span className="source-badge eol-badge">EOL</span></h3>
+                <div className="common-names-list">
+                  {eol.commonNames.map((n, i) => (
+                    <span key={i} className="common-name-tag">{n}</span>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {!wikidata && xcRecordings.length === 0 && !eol && (
+              <div className="panel-loading">
+                <div className="loading-dots"><span/><span/><span/></div>
+                <span>Loading facts from Wikidata, EOL, Xeno-canto…</span>
+              </div>
+            )}
           </>
         )}
 
@@ -331,6 +463,16 @@ function ExLink({ href, label, icon }) {
     <a href={href} target="_blank" rel="noopener noreferrer" className="ext-link">
       <span>{icon}</span> {label}
     </a>
+  )
+}
+
+function TraitRow({ icon, label, value }) {
+  return (
+    <div className="trait-row">
+      <span className="trait-icon">{icon}</span>
+      <span className="trait-label">{label}</span>
+      <span className="trait-value">{value}</span>
+    </div>
   )
 }
 

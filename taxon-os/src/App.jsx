@@ -5,7 +5,9 @@ import SearchBar  from './components/SearchBar'
 import ViewModeBar from './components/ViewModeBar'
 import Breadcrumb from './components/Breadcrumb'
 import StatsBar from './components/StatsBar'
-import { matchNames, fetchChildren, fetchLineage } from './api/otl'
+import { matchNames, fetchChildren, fetchLineage, fetchMRCA } from './api/otl'
+import { soundEngine } from './api/SoundEngine'
+import { lifePulse } from './api/LifePulse'
 
 // ── Immutable tree update ────────────────────────────────────────────────────
 function updateNode(tree, id, updates) {
@@ -26,11 +28,44 @@ export default function App() {
   const [totalExpanded, setTotalExpanded] = useState(0)
   const [viewMode,      setViewMode]      = useState('tree')
   const [lineage,       setLineage]       = useState([])
+  
+  // Immersive Layers state
+  const [soundEnabled,  setSoundEnabled]  = useState(false)
+  const [activePulse,   setActivePulse]   = useState(null)
+  
+  // Phylogenetic Compare Mode
+  const [compareNodes,  setCompareNodes]  = useState([]) // [Node1, Node2]
+  const [mrcaInfo,      setMrcaInfo]      = useState(null)
 
   // ── Initialize tree on load ──────────────────────────────────────────────
   useEffect(() => {
     initTree()
+    
+    // Initialize LifePulse listener (Addition #8)
+    lifePulse.subscribe(pulse => {
+      setActivePulse(pulse)
+      // Pulse should ideally find the node in tree and animate it
+      // For now, we'll just track it
+      setTimeout(() => setActivePulse(null), 5000)
+    })
+    lifePulse.start()
+
+    return () => lifePulse.stop()
   }, [])
+
+  // Audio trigger on selection (Addition #1, #6)
+  useEffect(() => {
+    if (selectedNode && soundEnabled) {
+      soundEngine.playTaxon(selectedNode.name)
+    }
+  }, [selectedNode, soundEnabled])
+
+  const toggleSound = () => {
+    const next = !soundEnabled
+    setSoundEnabled(next)
+    if (next) soundEngine.enable()
+    else soundEngine.disable()
+  }
 
   async function initTree() {
     try {
@@ -116,18 +151,95 @@ export default function App() {
     }
   }, [])
 
-  // ── Handle search selection ──────────────────────────────────────────────
-  const handleSearchSelect = useCallback((result) => {
+  // ── Handle search selection with Auto-Navigation ────────────────────────
+  const [navTarget, setNavTarget] = useState(null)
+
+  const handleSearchSelect = useCallback(async (result) => {
+    // 1. Set selected node immediately for the panel
     const nodeData = {
       id: result.node_id,
       name: result.name,
       rank: result.rank,
       num_tips: 1,
-      hasChildren: false,
+      hasChildren: true,
       ott_id: result.ott_id,
     }
     handleNodeSelect(nodeData)
+
+    // 2. Start expansion towards target
+    try {
+      const pathLineage = await fetchLineage(result.ott_id)
+      // Lineage is [Target, Parent, Grandparent, ..., Life]
+      // Reverse to get [Life, ..., Target]
+      const targetPath = pathLineage.reverse()
+      setNavTarget(targetPath)
+    } catch (err) {
+      console.error('Failed to resolve lineage:', err)
+    }
   }, [handleNodeSelect])
+
+  // ── Auto-expansion logic effect ──────────────────────────────────────────
+  const [navStatus, setNavStatus] = useState('')
+
+  useEffect(() => {
+    if (!navTarget || !tree) {
+      if (navStatus) setNavStatus('')
+      return
+    }
+
+    const expandNext = async () => {
+      let currentNode = tree
+      let nextToExpand = null
+      let targetName = navTarget[navTarget.length - 1]?.name
+
+      const getOtt = id => String(id).replace(/^(ott|life-)/, '')
+
+      // Path: [Life, Cellular, Eukaryota, ..., Target]
+      for (let i = 0; i < navTarget.length; i++) {
+        const step = navTarget[i]
+        const stepId = getOtt(step.node_id)
+        
+        // Match current node
+        if (getOtt(currentNode.id) === stepId || (currentNode.isRoot && i === 0)) {
+          const nextStep = navTarget[i+1]
+          if (!nextStep) {
+            setNavStatus('')
+            setNavTarget(null)
+            break
+          }
+
+          if (currentNode.children) {
+            const nextStepId = getOtt(nextStep.node_id)
+            const matchInTree = currentNode.children.find(c => 
+              getOtt(c.id) === nextStepId || c.name === nextStep.name
+            )
+
+            if (matchInTree) {
+              currentNode = matchInTree
+            } else {
+              setNavStatus(`Locating ${nextStep.name}…`)
+              nextToExpand = currentNode.id
+              break
+            }
+          } else if (currentNode.hasChildren) {
+            setNavStatus(`Expanding ${currentNode.name}…`)
+            nextToExpand = currentNode.id
+            break
+          }
+        }
+      }
+
+      if (nextToExpand) {
+        await expandNode(nextToExpand)
+      } else {
+        setNavStatus('')
+        setNavTarget(null)
+      }
+    }
+
+    const timer = setTimeout(expandNext, 800)
+    return () => clearTimeout(timer)
+  }, [navTarget, tree, expandNode, navStatus])
 
   // ── Handle navigate from lineage/breadcrumb ──────────────────────────────
   const handleNavigate = useCallback((item) => {
@@ -140,7 +252,39 @@ export default function App() {
       ott_id: item.ott_id,
     }
     handleNodeSelect(nodeData)
+    
+    // Trigger auto-expansion
+    setNavTarget(null)
+    fetchLineage(item.ott_id).then(l => {
+      if (l && l.length > 0) setNavTarget(l.reverse())
+    })
   }, [handleNodeSelect])
+
+  // ── Handle Compare Mode (Addition #5) ──────────────────────────────────────
+  const handleCompareTrigger = useCallback((node) => {
+    if (compareNodes.length === 0) {
+      setCompareNodes([node])
+    } else if (compareNodes.length === 1) {
+      const n2 = node
+      const n1 = compareNodes[0]
+      if (n1.ott_id === n2.ott_id) return
+      
+      setCompareNodes([n1, n2])
+      setNavStatus(`Calculating MRCA for ${n1.name} & ${n2.name}…`)
+      
+      fetchMRCA([n1.ott_id, n2.ott_id]).then(res => {
+        setMrcaInfo(res)
+        setNavStatus(`MRCA: ${res.mrca?.name || 'Life'}`)
+        setTimeout(() => setNavStatus(''), 3000)
+      }).catch(err => {
+        console.error('MRCA failed:', err)
+        setNavStatus('Path discovery failed')
+      })
+    } else {
+      setCompareNodes([node])
+      setMrcaInfo(null)
+    }
+  }, [compareNodes])
 
   // ── Count visible nodes ──────────────────────────────────────────────────
   function countNodes(node) {
@@ -162,11 +306,36 @@ export default function App() {
         </div>
         <div className="header-center">
           <SearchBar onSelect={handleSearchSelect} />
+          {navStatus && (
+            <div className="nav-status-overlay">
+              <span className="nav-status-spinner" />
+              {navStatus}
+            </div>
+          )}
         </div>
         <div className="header-right">
+          <button 
+            className={`header-sound-btn ${soundEnabled ? 'active' : ''}`} 
+            onClick={toggleSound}
+            title="Spatial Soundscapes (Xeno-canto)"
+          >
+            {soundEnabled ? '🔊' : '🔇'}
+          </button>
           <ViewModeBar currentMode={viewMode} onModeChange={setViewMode} />
         </div>
       </header>
+
+      {/* Global Biodiversity Pulse Overlay (Addition #8) */}
+      {activePulse && (
+        <div className="life-pulse-indicator">
+          <img src={activePulse.imageUrl} alt="" />
+          <div className="pulse-info">
+            <div className="pulse-tag">LIVE OBSERVATION</div>
+            <div className="pulse-name">{activePulse.taxonName}</div>
+            <div className="pulse-place">{activePulse.location}</div>
+          </div>
+        </div>
+      )}
 
       {/* Breadcrumb */}
       {lineage.length > 0 && (
@@ -195,6 +364,8 @@ export default function App() {
           <TreeCanvas
             treeData={tree}
             selectedNodeId={selectedNode?.id}
+            compareNodes={compareNodes}
+            mrcaInfo={mrcaInfo}
             onNodeSelect={handleNodeSelect}
             onNodeExpand={expandNode}
             onNodeCollapse={collapseNode}
@@ -204,8 +375,11 @@ export default function App() {
         {selectedNode && (
           <TaxonPanel
             node={selectedNode}
+            compareMode={compareNodes.length === 1}
+            isComparing={compareNodes.some(n => n.ott_id === selectedNode.ott_id)}
             onClose={() => { setSelectedNode(null); setLineage([]) }}
             onNavigate={handleNavigate}
+            onCompare={() => handleCompareTrigger(selectedNode)}
           />
         )}
       </main>

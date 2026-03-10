@@ -1226,6 +1226,9 @@ html, body, #root {
 .wd-badge  { background: rgba(153,102,255,0.2); color: #9966ff; border: 1px solid rgba(153,102,255,0.4); }
 .eol-badge { background: rgba(0,180,120,0.2);   color: #00b478; border: 1px solid rgba(0,180,120,0.4); }
 .xc-badge  { background: rgba(255,157,68,0.2);  color: #ff9d44; border: 1px solid rgba(255,157,68,0.4); }
+.ncbi-badge { background: rgba(0,123,255,0.2); color: #3399ff; border: 1px solid rgba(0,123,255,0.4); }
+
+.ncbi-link-row { margin-top: 8px; font-size: 11px; }
 
 /* ── Trait Grid ─────────────────────────────────────────────────── */
 .traits-grid { display: flex; flex-direction: column; gap: 6px; }

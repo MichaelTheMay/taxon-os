@@ -7,6 +7,7 @@ import { getIUCNColor, getIUCNLabel } from '../api/iucn'
 import { fetchWikidataQuickFacts } from '../api/wikidata'
 import { fetchEOLData } from '../api/eol'
 import { fetchXCRecordings } from '../api/xenocanto'
+import { fetchNCBIGenome, formatGenomeSize } from '../api/ncbi'
 import OccurrenceMap from './OccurrenceMap'
 
 const TABS = [
@@ -37,6 +38,7 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
   const [wikidata, setWikidata] = useState(null)
   const [eol, setEol] = useState(null)
   const [xcRecordings, setXcRecordings] = useState([])
+  const [genome, setGenome] = useState(null)
   const [audioPlaying, setAudioPlaying] = useState(null) // {id, audio}
   
   const panelRef = useRef(null)
@@ -53,7 +55,7 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
     setWiki(null); setImages([]); setGbif(null); setInat(null)
     setOccCount(null); setOccPoints([]); setProfile(null)
     setYearlyData([]); setLineage([]); setInatObs([])
-    setWikidata(null); setEol(null); setXcRecordings([])
+    setWikidata(null); setEol(null); setXcRecordings([]); setGenome(null)
     if (audioPlaying) { audioPlaying.audio?.pause(); setAudioPlaying(null) }
 
     const name = node.name
@@ -99,10 +101,12 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
       fetchWikidataQuickFacts(name),
       fetchEOLData(name),
       fetchXCRecordings(name, 5),
-    ]).then(([wdRes, eolRes, xcRes]) => {
+      fetchNCBIGenome(name),
+    ]).then(([wdRes, eolRes, xcRes, ncbiRes]) => {
       if (wdRes.status === 'fulfilled') setWikidata(wdRes.value)
       if (eolRes.status === 'fulfilled') setEol(eolRes.value)
       if (xcRes.status === 'fulfilled') setXcRecordings(xcRes.value)
+      if (ncbiRes.status === 'fulfilled') setGenome(ncbiRes.value)
     })
 
     setLoading(false)
@@ -318,6 +322,26 @@ export default function TaxonPanel({ node, onClose, onNavigate, onCompare, compa
                   {!wikidata.mass && !wikidata.lifespan && !wikidata.diet && (
                     <p className="no-data-msg">No structured trait data available for this taxon yet.</p>
                   )}
+                </div>
+              </section>
+            )}
+
+            {/* NCBI Genomic Data */}
+            {genome && (
+              <section className="panel-section">
+                <h3 className="section-heading">Genomics <span className="source-badge ncbi-badge">NCBI</span></h3>
+                <div className="traits-grid">
+                  <TraitRow icon="🧬" label="Assembly" value={genome.assemblyName} />
+                  <TraitRow icon="📑" label="Accession" value={genome.accession} />
+                  <TraitRow icon="📈" label="Level" value={genome.level} />
+                  {genome.totalLength && (
+                    <TraitRow icon="📏" label="Size" value={formatGenomeSize(genome.totalLength)} />
+                  )}
+                  <div className="ncbi-link-row">
+                    <a href={genome.ncbiUrl} target="_blank" rel="noopener noreferrer" className="xc-link">
+                      View on NCBI Datasets ↗
+                    </a>
+                  </div>
                 </div>
               </section>
             )}

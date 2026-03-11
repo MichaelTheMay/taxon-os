@@ -10,7 +10,13 @@ export default defineConfig({
         target: 'https://api.opentreeoflife.org/v3',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/otl-api/, '')
+      },
+      '/xc-api': {
+        target: 'https://xeno-canto.org',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/xc-api/, '')
       }
     }
   }
 })
+

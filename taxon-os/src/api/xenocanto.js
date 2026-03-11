@@ -1,21 +1,47 @@
 /**
- * Xeno-canto API v2
- * Public, CORS-enabled. No key needed for v2.
- * Provides recordings of bird, frog, bat, and insect sounds.
+ * Xeno-canto API v3
+ * Endpoint: https://xeno-canto.org/api/3/recordings
+ * Requires an API key (free — register at xeno-canto.org).
+ * Set VITE_XC_API_KEY in your .env file to enable wildlife sounds.
+ * If no key is found, all functions return empty arrays gracefully.
  */
 
-const XC_BASE = 'https://xeno-canto.org/api/2/recordings'
+const XC_KEY = import.meta.env.VITE_XC_API_KEY || ''
+const XC_BASE = '/xc-api/api/3/recordings'
 
+/**
+ * Fetch recordings for a scientific name using v3 tag-based query.
+ * Uses `sp:` + `gen:` tags for precise matching, falls back to name string.
+ * @param {string} scientificName  e.g. "Turdus merula"
+ * @param {number} limit           max recordings to return
+ */
 export async function fetchXCRecordings(scientificName, limit = 3) {
+  if (!XC_KEY) return []   // No key → silent no-op
+
   try {
-    const res = await fetch(
-      `${XC_BASE}?query=${encodeURIComponent(scientificName + ' q:A')}`
-    )
-    if (!res.ok) return []
+    const parts = scientificName.trim().split(/\s+/)
+    // Build tag query: gen:Turdus sp:merula  (most precise)
+    // If only one word, use it as a general name query
+    const query = parts.length >= 2
+      ? `gen:${parts[0]} sp:${parts[1]} q:A`
+      : `${scientificName} q:A`
+
+    const url = `${XC_BASE}?query=${encodeURIComponent(query)}&key=${encodeURIComponent(XC_KEY)}&per_page=50`
+    const res = await fetch(url)
+
+    if (!res.ok) {
+      console.warn(`Xeno-canto v3 request failed: ${res.status}`)
+      return []
+    }
+
     const data = await res.json()
-    
+    if (data.error) {
+      console.warn('Xeno-canto v3 error:', data.message)
+      return []
+    }
+
     return (data.recordings || [])
-      .filter(r => r.file && r.en)
+      .filter(r => r.file && r['file'])
       .slice(0, limit)
       .map(r => ({
         id: r.id,
@@ -24,9 +50,9 @@ export async function fetchXCRecordings(scientificName, limit = 3) {
         recordist: r.rec,
         country: r.cnt,
         locality: r.loc,
-        type: r.type, // 'call', 'song', etc.
-        quality: r.q,  // A-E
-        url: r.file,   // direct audio URL
+        type: r.type,
+        quality: r.q,
+        url: r['file'].startsWith('//') ? `https:${r['file']}` : r['file'],
         license: r.lic,
         date: r.date,
         pageUrl: `https://xeno-canto.org/${r.id}`,

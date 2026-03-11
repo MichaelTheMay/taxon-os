@@ -5,7 +5,7 @@ import SearchBar  from './components/SearchBar'
 import ViewModeBar from './components/ViewModeBar'
 import Breadcrumb from './components/Breadcrumb'
 import StatsBar from './components/StatsBar'
-import { matchNames, fetchChildren, fetchLineage, fetchMRCA } from './api/otl'
+import { matchNames, fetchChildren, fetchLineage, fetchMRCA, fetchRandomTaxon } from './api/otl'
 import { soundEngine } from './api/SoundEngine'
 import { lifePulse } from './api/LifePulse'
 import { fetchCladeImagery } from './api/gbif'
@@ -54,6 +54,7 @@ export default function App() {
     visible: true
   })
   const [showSettings, setShowSettings] = useState(false)
+  const [tracing,       setTracing]      = useState(false)  // true while Surprise Me is tracing
 
   // ── Initialize tree on load ──────────────────────────────────────────────
   useEffect(() => {
@@ -148,7 +149,7 @@ export default function App() {
       }))
       setTotalExpanded(n => n + 1)
 
-      // Fetch clade imagery for the expanded node
+      // Fetch clade imagery for the expanded node itself
       const currentNode = (function findNode(t, id) {
         if (!t) return null
         if (t.id === id) return t
@@ -164,15 +165,35 @@ export default function App() {
         fetchCladeImagery(currentNode.name).then(imgs => {
           if (imgs.length > 0) {
             setCladeMetaData(prev => ({ ...prev, [nodeId]: { name: currentNode.name, images: imgs } }))
-            setNodeIcons(prev => ({ ...prev, [nodeId]: imgs[0] })) // Set first image as node icon
+            setNodeIcons(prev => ({ ...prev, [nodeId]: imgs[0] }))
           }
         })
       }
+
+      // Background-prefetch gallery images for every newly added child node
+      // so the in-node collage can display immediately when the user zooms in.
+      // Stagger requests slightly (50ms apart) to avoid hammering GBIF.
+      childNodes.forEach((child, i) => {
+        setTimeout(() => {
+          fetchCladeImagery(child.name).then(imgs => {
+            if (imgs.length > 0) {
+              setCladeMetaData(prev => {
+                if (prev[child.id]) return prev   // already fetched, skip
+                return { ...prev, [child.id]: { name: child.name, images: imgs } }
+              })
+              setNodeIcons(prev => {
+                if (prev[child.id]) return prev
+                return { ...prev, [child.id]: imgs[0] }
+              })
+            }
+          }).catch(() => {/* silently ignore per-child fetch errors */})
+        }, i * 60)   // 60ms stagger per child = gentle on rate limits
+      })
     } catch (err) {
       console.error('Expand failed:', err)
       setTree(prev => updateNode(prev, nodeId, { _loading: false }))
     }
-  }, [])
+  }, [tree])
 
   // ── Collapse a node ──────────────────────────────────────────────────────
   const collapseNode = useCallback((nodeId) => {
@@ -354,6 +375,106 @@ export default function App() {
     })
   }, [handleNodeSelect])
 
+  // ── Surprise Me: trace Life → random organism, restore tree after ──────────
+  const tracePath = useCallback(async () => {
+    if (tracing) return
+    setTracing(true)
+
+    try {
+      // 1. Pick a random taxon
+      const taxon = await fetchRandomTaxon()
+      if (!taxon) return
+
+      // 2. Fetch its full lineage (comes back [taxon, parent, …, Life])
+      const rawLineage = await fetchLineage(taxon.ott_id)
+      // Reverse to Life → … → taxon
+      const path = [...rawLineage].reverse()
+
+      // 3. Walk the path, expanding only nodes not already open
+      const freshlyExpanded = []  // IDs we opened so we can collapse them after
+      const delay = ms => new Promise(r => setTimeout(r, ms))
+      const getOtt = id => String(id).replace(/^ott/, '')
+
+      // Helper: check if a node with a given ott_id is already expanded in the tree
+      const findInTree = (node, ottStr) => {
+        if (!node) return null
+        if (getOtt(node.id) === ottStr) return node
+        if (!node.children) return null
+        for (const c of node.children) {
+          const found = findInTree(c, ottStr)
+          if (found) return found
+        }
+        return null
+      }
+
+      for (let i = 0; i < path.length - 1; i++) {
+        const step     = path[i]
+        const nextStep = path[i + 1]
+        const stepOtt  = getOtt(step.node_id)
+        const nextOtt  = getOtt(nextStep.node_id)
+
+        // Read the current tree snapshot
+        let treeSnap
+        setTree(t => { treeSnap = t; return t })
+        await delay(0)  // flush so treeSnap is set
+
+        const stepNode = findInTree(treeSnap, stepOtt) || (i === 0 ? treeSnap : null)
+        if (!stepNode) break
+
+        // Check if next step already exists among this node's children
+        const alreadyHasNext = stepNode.children?.some(c => getOtt(c.id) === nextOtt || c.name === nextStep.name)
+
+        if (!alreadyHasNext && stepNode.hasChildren) {
+          // Expand this node
+          setNavStatus(`Tracing → ${nextStep.name}…`)
+          const nodeId = stepNode.id
+          await new Promise(resolve => {
+            // Use expandNode but track that we opened it
+            const children = fetchChildren(nodeId)
+            children.then(ch => {
+              if (!ch || ch.length === 0) { resolve(); return }
+              const childNodes = ch.map(c => ({
+                id: c.id, name: c.name, rank: c.rank,
+                num_tips: c.num_tips, hasChildren: c.num_tips > 1,
+                children: null, _loading: false, ott_id: c.ott_id,
+              }))
+              setTree(prev => updateNode(prev, nodeId, { children: childNodes, _loading: false }))
+              freshlyExpanded.push(nodeId)
+              resolve()
+            }).catch(() => resolve())
+          })
+          await delay(750)   // pause so the animation is visible
+        }
+      }
+
+      // 4. Select the final organism
+      const target = path[path.length - 1]
+      const targetNodeData = {
+        id: target.node_id,
+        name: target.name,
+        rank: target.rank,
+        num_tips: 1,
+        hasChildren: false,
+        ott_id: target.ott_id,
+      }
+      handleNodeSelect(targetNodeData)
+      setNavStatus('')
+
+      // 5. After 3 seconds, collapse any nodes we freshly opened (restore prior state)
+      setTimeout(() => {
+        freshlyExpanded.forEach(id => {
+          setTree(prev => updateNode(prev, id, { children: null }))
+        })
+      }, 3000)
+
+    } catch (err) {
+      console.error('Trace path failed:', err)
+      setNavStatus('')
+    } finally {
+      setTracing(false)
+    }
+  }, [tracing, handleNodeSelect])
+
   // ── Handle Compare Mode (Addition #5) ──────────────────────────────────────
   const handleCompareTrigger = useCallback((node) => {
     if (compareNodes.length === 0) {
@@ -399,7 +520,7 @@ export default function App() {
           <span className="brand-sub">Atlas of All Life</span>
         </div>
         <div className="header-center">
-          <SearchBar onSelect={handleSearchSelect} />
+          <SearchBar onSelect={handleSearchSelect} onSurprise={tracePath} surpriseLoading={tracing} />
           {navStatus && (
             <div className="nav-status-overlay">
               <span className="nav-status-spinner" />

@@ -1,437 +1,507 @@
 import { useEffect, useRef, useCallback } from 'react'
 import * as d3 from 'd3'
 
-// ── Color palette by clade ──────────────────────────────────────────────────
+// ── Color palette ────────────────────────────────────────────────────────────
 const CLADE_COLORS = {
-  Bacteria:       '#FF6B35',
-  Archaea:        '#C084FC',
-  Eukaryota:      '#00FFD4',
-  Fungi:          '#FBBF24',
-  Viridiplantae:  '#4ADE80',
-  Metazoa:        '#60A5FA',
-  Amoebozoa:      '#F472B6',
-  Alveolata:      '#34D399',
-  Stramenopiles:  '#A78BFA',
-  Rhodophyta:     '#FB7185',
-  default:        '#64748B',
+  Bacteria:      '#FF6B35',
+  Archaea:       '#C084FC',
+  Eukaryota:     '#00FFD4',
+  Fungi:         '#FBBF24',
+  Viridiplantae: '#4ADE80',
+  Metazoa:       '#60A5FA',
+  Amoebozoa:     '#F472B6',
+  Alveolata:     '#34D399',
+  Stramenopiles: '#A78BFA',
+  Rhodophyta:    '#FB7185',
+  default:       '#94A3B8',
 }
 
-function getCladeColor(node, ancestors) {
-  const path = [node.name, ...(ancestors || []).map(a => a.name)]
-  for (const name of path) {
-    if (CLADE_COLORS[name]) return CLADE_COLORS[name]
-  }
+function cladeColor(d) {
+  let cur = d
+  while (cur) { if (CLADE_COLORS[cur.data.name]) return CLADE_COLORS[cur.data.name]; cur = cur.parent }
   return CLADE_COLORS.default
 }
 
-function nodeRadius(numTips) {
-  if (!numTips || numTips <= 1) return 4
-  return Math.min(18, 4 + Math.sqrt(Math.log10(numTips + 10)) * 5)
+function hexToRgba(hex, a) {
+  const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16)
+  return `rgba(${r},${g},${b},${a})`
 }
 
-function radialPoint(x, y) {
-  return [(+y) * Math.cos(x - Math.PI / 2), (+y) * Math.sin(x - Math.PI / 2)]
+function fmtNum(n) {
+  if (n >= 1e6) return `${(n/1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${(n/1e3).toFixed(0)}K`
+  return String(n||0)
 }
 
-// ── Color cache: walk up hierarchy to determine clade ──────────────────────
-function buildColorMap(hierarchyRoot) {
-  const map = {}
-  hierarchyRoot.each(d => {
-    let color = CLADE_COLORS.default
-    let current = d
-    while (current) {
-      if (CLADE_COLORS[current.data.name]) { color = CLADE_COLORS[current.data.name]; break }
-      current = current.parent
-    }
-    map[d.data.id] = color
+function nodeRadius(d) {
+  const t = d.data.num_tips || 1
+  if (d.depth === 0) return 88
+  if (d.data.children) return Math.max(38, Math.min(110, 16 + Math.log10(t+2)*20))
+  return Math.max(16, Math.min(50, 9 + Math.log10(t+2)*12))
+}
+
+// ── Enhancement 6: gradient ID per link ─────────────────────────────────────
+function gradId(src, tgt) {
+  return `lg-${String(src.data.id).replace(/\W/g,'')}-${String(tgt.data.id).replace(/\W/g,'')}`
+}
+
+// ── Enhancement 10: compute bounding box of all nodes ───────────────────────
+function boundingBox(nodes) {
+  let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity
+  nodes.forEach(d => {
+    if (!d.x||!d.y) return
+    x0=Math.min(x0,d.x-d.r); y0=Math.min(y0,d.y-d.r)
+    x1=Math.max(x1,d.x+d.r); y1=Math.max(y1,d.y+d.r)
   })
-  return map
+  return {x0,y0,x1,y1,w:x1-x0,h:y1-y0}
 }
 
-// ── Main Component ─────────────────────────────────────────────────────────
-export default function TreeCanvas({ 
-  treeData, 
-  selectedNodeId, 
-  compareNodes = [], 
-  mrcaInfo = null,
-  cladeMetaData = {},
-  nodeIcons = {},
-  labelConfig = { fontSize: 12, fontWeight: 'normal', glow: true, uppercase: false, visible: true },
-  onNodeSelect, 
-  onNodeExpand, 
-  onNodeCollapse 
+// ────────────────────────────────────────────────────────────────────────────
+export default function TreeCanvas({
+  treeData, selectedNodeId,
+  cladeMetaData={}, nodeIcons={},
+  labelConfig={fontSize:12,fontWeight:'normal'},
+  onNodeSelect, onNodeExpand, onNodeCollapse,
 }) {
-  const svgRef = useRef(null)
-  const gRef   = useRef(null)
-  const zoomRef = useRef(null)
-  const colorMapRef = useRef({})
+  const svgRef     = useRef(null)
+  const gRef       = useRef(null)
+  const zoomRef    = useRef(null)
+  const simRef     = useRef(null)
   const tooltipRef = useRef(null)
+  const posCache   = useRef({})
+  const defsRef    = useRef(null)
 
-  // ── Setup zoom once ───────────────────────────────────────────────────────
+  // ── Zoom setup (Enhancement 3: zoom-banded image reveal) ─────────────────
   useEffect(() => {
     if (!svgRef.current) return
     const svg = d3.select(svgRef.current)
-
-    const zoom = d3.zoom()
-      .scaleExtent([0.04, 12])
-      .on('zoom', e => d3.select(gRef.current).attr('transform', e.transform))
-
+    const zoom = d3.zoom().scaleExtent([0.015, 18])
+      .on('zoom', ({ transform: t }) => {
+        d3.select(gRef.current).attr('transform', t)
+        // Enhancement 3: images fade in as you zoom
+        const imgOpacity = Math.min(1, Math.max(0, (t.k - 0.7) * 1.6))
+        d3.select(gRef.current).selectAll('.img-layer').style('opacity', imgOpacity)
+        // Labels: clades visible early, leaves only when zoomed in
+        d3.select(gRef.current).selectAll('.bubble-label').style('opacity', d => {
+          if (!d) return 0
+          if (d.data.children) return t.k > 0.2 ? 1 : 0
+          return t.k > 1.0 ? 1 : 0
+        })
+      })
     svg.call(zoom)
     zoomRef.current = zoom
-
-    // Center on load
     const { width, height } = svgRef.current.getBoundingClientRect()
-    svg.call(zoom.transform, d3.zoomIdentity.translate(width / 2, height / 2).scale(0.9))
-
+    svg.call(zoom.transform, d3.zoomIdentity.translate(width/2, height/2).scale(0.6))
     return () => svg.on('.zoom', null)
   }, [])
 
-  // renderTree defined below; we call it via renderTreeRef so the effect always uses latest version
+  const autoFit = useCallback((nodes) => {
+    if (!svgRef.current || !zoomRef.current) return
+    const bb = boundingBox(nodes)
+    if (!isFinite(bb.w)) return
+    const { width, height } = svgRef.current.getBoundingClientRect()
+    const pad = 120
+    const scale = Math.min(0.95, (width-pad) / bb.w, (height-pad) / bb.h)
+    const cx = (bb.x0 + bb.x1) / 2, cy = (bb.y0 + bb.y1) / 2
+    d3.select(svgRef.current).transition().duration(900).ease(d3.easeCubicInOut)
+      .call(zoomRef.current.transform, d3.zoomIdentity.translate(width/2 - cx*scale, height/2 - cy*scale).scale(scale))
+  }, [])
 
-  const renderTreeRef = useRef(null)
+  const renderTree = useCallback((data, selectedId) => {
+    if (!data || !gRef.current) return
+    if (simRef.current) { simRef.current.stop(); simRef.current = null }
 
-  const renderTree = useCallback((data, selectedId, compares, mrca) => {
-    const g = d3.select(gRef.current)
+    const g   = d3.select(gRef.current)
     const svg = d3.select(svgRef.current)
 
-    // Build hierarchy
-    const root = d3.hierarchy(data, d => d.children && d.children.length > 0 ? d.children : null)
-    const leafCount = root.leaves().length
-    const radius = Math.max(220, leafCount * 14)
+    const root     = d3.hierarchy(data, d => d.children?.length ? d.children : null)
+    const allNodes = root.descendants()
+    const allLinks = root.links()
 
-    d3.cluster()
-      .size([2 * Math.PI, radius])
-      .separation((a, b) => (a.parent === b.parent ? 1 : 2) / a.depth)
-      (root)
+    allNodes.forEach(d => {
+      d.color = cladeColor(d)
+      d.r = nodeRadius(d)
+      const cached = posCache.current[d.data.id]
+      if (cached) { d.x = cached.x; d.y = cached.y }
+      else if (d.parent) {
+        const p = posCache.current[d.parent.data.id]
+        d.x = p ? p.x + (Math.random()-.5)*70 : (Math.random()-.5)*100
+        d.y = p ? p.y + (Math.random()-.5)*70 : (Math.random()-.5)*100
+      } else { d.x = d.x??0; d.y = d.y??0 }
+    })
 
-    // Build color map
-    colorMapRef.current = buildColorMap(root)
+    // ── Enhancement 1: Pin root ──────────────────────────────────────────────
+    const rootNode = allNodes[0]
+    rootNode.fx = 0; rootNode.fy = 0
 
-    // Calculate paths for MRCA (Addition #5)
-    let activePathNodes = new Set()
-    let activeMRCAId = null
-    
-    if (compares.length === 2 && mrca) {
-      const getOtt = id => String(id).replace(/^(ott|life-)/, '')
-      activeMRCAId = getOtt(mrca.mrca?.node_id)
-      
-      compares.forEach(target => {
-        const d3Node = root.descendants().find(d => getOtt(d.data.id) === getOtt(target.id))
-        if (d3Node) {
-          let curr = d3Node
-          while (curr) {
-            activePathNodes.add(curr.data.id)
-            if (getOtt(curr.data.id) === activeMRCAId) break
-            curr = curr.parent
-          }
-        }
-      })
+    // ── Enhancement 6: linearGradients per link ──────────────────────────────
+    const svgElem = svgRef.current
+    let defsElem = svgElem.querySelector('defs#dynamic-defs')
+    if (!defsElem) {
+      defsElem = document.createElementNS('http://www.w3.org/2000/svg','defs')
+      defsElem.id = 'dynamic-defs'
+      svgElem.appendChild(defsElem)
     }
-
-    // ── Tooltip helpers ──────────────────────────────────────────────────
-    const tooltip = d3.select(tooltipRef.current)
-
-    const showTooltip = (event, d) => {
-      tooltip
-        .style('opacity', 1)
-        .style('left', `${event.clientX + 14}px`)
-        .style('top',  `${event.clientY - 28}px`)
-        .html(`
-          <div class="tt-name">${d.data.name}</div>
-          <div class="tt-meta">${d.data.rank}${d.data.num_tips > 1 ? ` · ${fmtNum(d.data.num_tips)} spp.` : ''}</div>
-        `)
-    }
-
-    const hideTooltip = () => tooltip.style.opacity = 0
-
-    // ── Clade Halos (Visual Clusters) ──────────────────────────
-    const haloLayer = g.selectAll('.clade-halo')
-      .data(Object.keys(cladeMetaData).map(id => {
-        const d3Node = root.descendants().find(d => d.data.id === id)
-        if (!d3Node || !d3Node.children) return null
-        const leaves = d3Node.leaves()
-        const xMin = d3.min(leaves, d => d.x)
-        const xMax = d3.max(leaves, d => d.x)
-        const yMax = d3.max(leaves, d => d.y)
-        return { 
-          id, 
-          node: d3Node, 
-          x0: xMin, x1: xMax, 
-          y0: d3Node.y, y1: yMax + 40,
-          meta: cladeMetaData[id]
-        }
-      }).filter(Boolean), d => d.id)
-
-    haloLayer.exit().transition().duration(400).attr('opacity', 0).remove()
-
-    const haloEnter = haloLayer.enter().append('g').attr('class', 'clade-halo').attr('opacity', 0)
-    
-    haloEnter.append('path')
-      .attr('class', 'halo-path')
-      .attr('d', d3.arc()
-        .startAngle(d => d.x0)
-        .endAngle(d => d.x1)
-        .innerRadius(d => d.y0 - 20)
-        .outerRadius(d => d.y1)
-        .padAngle(0.01)
-        .cornerRadius(12)
-      )
-      .attr('fill', d => colorMapRef.current[d.id] || '#00FFD4')
-      .attr('opacity', 0.1)
-
-    // Clade Title
-    haloEnter.append('text')
-      .attr('class', 'halo-title')
-      .attr('text-anchor', 'middle')
-      .attr('dy', -12)
-      .append('textPath')
-      .attr('xlink:href', d => {
-        const pathId = `arcpath-${d.id.replace(/\W/g, '')}`
-        if (!svg.select(`#${pathId}`).node()) {
-          svg.select('defs').append('path')
-            .attr('id', pathId)
-            .attr('d', d3.arc()({
-              startAngle: d.x0, 
-              endAngle: d.x1, 
-              innerRadius: d.y1 + 10, 
-              outerRadius: d.y1 + 10
-            }))
-        }
-        return `#${pathId}`
-      })
-      .attr('startOffset', '50%')
-      .text(d => d.meta.name)
-
-    // Representative Images
-    haloEnter.selectAll('.halo-img')
-      .data(d => (d.meta.images || []).slice(0, 3).map((url, i) => ({ url, i, halo: d })))
-      .enter().append('image')
-      .attr('class', 'halo-img')
-      .attr('xlink:href', d => d.url)
-      .attr('width', 44).attr('height', 44)
-      .attr('x', d => {
-        const angle = d.halo.x0 + (d.halo.x1 - d.halo.x0) * (d.i / 2)
-        return radialPoint(angle, d.halo.y1 + 15)[0] - 22
-      })
-      .attr('y', d => {
-        const angle = d.halo.x0 + (d.halo.x1 - d.halo.x0) * (d.i / 2)
-        return radialPoint(angle, d.halo.y1 + 15)[1] - 22
-      })
-      .attr('clip-path', 'circle(50%)')
-
-    haloEnter.merge(haloLayer).transition().duration(500).attr('opacity', 1)
-
-    // ── Links ─────────────────────────────────────────────────────────────
-    const linkGen = d3.linkRadial().angle(d => d.x).radius(d => d.y)
-    const links = g.selectAll('.link').data(root.links(), d => `${d.source.data.id}→${d.target.data.id}`)
-    links.exit().remove()
-
-    links.enter().append('path')
-      .attr('class', d => `link ${d.target.data.num_tips > 1000 ? 'link-flow' : ''}`)
-      .merge(links)
-      .attr('d', linkGen)
-      .attr('stroke', d => colorMapRef.current[d.target.data.id] || '#64748B')
-      .attr('stroke-width', d => Math.max(0.6, Math.min(3, Math.log10(d.target.data.num_tips || 1))))
-      .attr('opacity', 0.4)
-
-    // ── Node Groups ───────────────────────────────────────────────────────
-    const nodes = g.selectAll('.node-group').data(root.descendants(), d => d.data.id)
-    nodes.exit().remove()
-
-    const nodesEnter = nodes.enter().append('g')
-      .attr('class', 'node-group')
-      .style('cursor', 'pointer')
-      .on('click', (e, d) => {
-        e.stopPropagation()
-        if (d.data.hasChildren) {
-          if (d.data.children) onNodeCollapse(d.data.id)
-          else onNodeExpand(d.data.id)
-        }
-        onNodeSelect(d.data)
-      })
-
-    nodesEnter.append('circle').attr('class', 'node-circle')
-    nodesEnter.append('clipPath')
-      .attr('id', d => `clip-${d.data.id.replace(/\W/g, '')}`)
-      .append('circle')
-    nodesEnter.append('image').attr('class', 'node-icon')
-    nodesEnter.append('text').attr('class', 'node-label')
-
-    const nodesAll = nodesEnter.merge(nodes)
-    nodesAll.attr('transform', d => `translate(${radialPoint(d.x, d.y)})`)
-
-    nodesAll.select('.node-circle')
-      .attr('r', d => nodeRadius(d.data.num_tips))
-      .attr('fill', d => d.data.id === selectedId ? '#fff' : colorMapRef.current[d.data.id])
-      .attr('opacity', d => nodeIcons[d.data.id] ? 0.2 : 1)
-      .attr('stroke', d => d.data.id === selectedId ? '#fff' : 'rgba(255,255,255,0.2)')
-      .attr('stroke-width', d => d.data.id === selectedId ? 2 : 1)
-
-    nodesAll.select('clipPath circle')
-      .attr('r', d => nodeRadius(d.data.num_tips))
-
-    nodesAll.select('.node-icon')
-      .attr('xlink:href', d => nodeIcons[d.data.id] || '')
-      .attr('x', d => -nodeRadius(d.data.num_tips))
-      .attr('y', d => -nodeRadius(d.data.num_tips))
-      .attr('width', d => nodeRadius(d.data.num_tips) * 2)
-      .attr('height', d => nodeRadius(d.data.num_tips) * 2)
-      .attr('clip-path', d => `url(#clip-${d.data.id.replace(/\W/g, '')})`)
-      .attr('opacity', d => nodeIcons[d.data.id] || 0)
-
-    nodesAll.select('.node-label')
-      .text(d => {
-        if (d.depth < 2 || d.data.id === selectedId || d.data.num_tips > 1000) return d.data.name
-        return ''
-      })
-      .attr('dy', '0.31em')
-      .attr('x', d => d.x < Math.PI ? 10 : -10)
-      .attr('text-anchor', d => d.x < Math.PI ? 'start' : 'end')
-      .attr('transform', d => d.x >= Math.PI ? 'rotate(180)' : null)
-      .style('font-size', `${labelConfig.fontSize}px`)
-      .style('font-weight', labelConfig.fontWeight)
-      .style('text-transform', labelConfig.uppercase ? 'uppercase' : 'none')
-      .style('display', labelConfig.visible ? 'block' : 'none')
-      .style('text-shadow', labelConfig.glow ? '0 0 5px rgba(255,255,255,0.7)' : 'none')
-      .attr('fill', '#fff')
-
-    // ── Auto-center ──
-    if (selectedId) {
-      const d = root.descendants().find(d => d.data.id === selectedId)
-      if (d) {
-        const [tx, ty] = radialPoint(d.x, d.y)
-        const { width, height } = svgRef.current.getBoundingClientRect()
-        svg.transition().duration(800).call(
-          zoomRef.current.transform,
-          d3.zoomIdentity.translate(width/2 - tx, height/2 - ty).scale(1.2)
-        )
+    defsRef.current = defsElem
+    allLinks.forEach(lk => {
+      const id = gradId(lk.source, lk.target)
+      if (!defsElem.querySelector(`#${id}`)) {
+        const grad = document.createElementNS('http://www.w3.org/2000/svg','linearGradient')
+        grad.id = id; grad.setAttribute('gradientUnits','userSpaceOnUse')
+        const s1 = document.createElementNS('http://www.w3.org/2000/svg','stop')
+        s1.setAttribute('offset','0%'); s1.setAttribute('stop-color', lk.source.color)
+        const s2 = document.createElementNS('http://www.w3.org/2000/svg','stop')
+        s2.setAttribute('offset','100%'); s2.setAttribute('stop-color', lk.target.color)
+        grad.appendChild(s1); grad.appendChild(s2)
+        defsElem.appendChild(grad)
       }
+    })
+
+    // ── Tooltip ──────────────────────────────────────────────────────────────
+    const tip = d3.select(tooltipRef.current)
+    const showTip = (ev, d) => tip.style('opacity',1)
+      .style('left',`${ev.clientX+18}px`).style('top',`${ev.clientY-36}px`)
+      .html(`
+        <div class="tt-name" style="border-left:3px solid ${d.color};padding-left:8px">${d.data.name}</div>
+        <div class="tt-meta">${d.data.rank} · <b>${fmtNum(d.data.num_tips)}</b> species</div>
+        ${d.data.hasChildren && !d.data.children ? '<div class="tt-hint">Double-click to expand</div>' : ''}
+        ${d.data.children ? '<div class="tt-hint">Double-click to collapse</div>' : ''}
+      `)
+    const hideTip = () => tip.style('opacity',0)
+
+    // ── Links layer ──────────────────────────────────────────────────────────
+    let linkLayer = g.select('.links-layer')
+    if (linkLayer.empty()) linkLayer = g.append('g').attr('class','links-layer')
+
+    // Enhancement 5: nebula backgrounds behind expanded clades
+    let nebulaLayer = g.select('.nebula-layer')
+    if (nebulaLayer.empty()) nebulaLayer = g.insert('g','.links-layer').attr('class','nebula-layer')
+
+    const nebs = nebulaLayer.selectAll('circle.nebula').data(
+      allNodes.filter(d => d.depth > 0 && d.data.children),
+      d => d.data.id
+    )
+    nebs.exit().transition().duration(600).attr('r',0).attr('opacity',0).remove()
+    nebs.enter().append('circle').attr('class','nebula')
+      .attr('r',0).attr('opacity',0)
+      .merge(nebs)
+      .transition().duration(900)
+      .attr('r', d => d.r * 4.5)
+      .attr('fill', d => hexToRgba(d.color, 0.04))
+      .attr('filter','url(#aura-blur)')
+
+    // Link paths
+    const linkSel = linkLayer.selectAll('path.link-edge')
+      .data(allLinks, d => `${d.source.data.id}--${d.target.data.id}`)
+    linkSel.exit().transition().duration(400).attr('opacity',0).remove()
+    const linkEnter = linkSel.enter().append('path').attr('class','link-edge')
+      .attr('fill','none').attr('stroke-opacity',0).attr('stroke-linecap','round')
+    const linkAll = linkEnter.merge(linkSel)
+      .attr('stroke', d => `url(#${gradId(d.source, d.target)})`)
+      // Enhancement 2: taper by depth
+      .attr('stroke-width', d => Math.max(1, 5 - d.source.depth * 1.0))
+    linkAll.transition().duration(500).attr('stroke-opacity', 0.55)
+
+    // ── Node layer ───────────────────────────────────────────────────────────
+    let nodeLayer = g.select('.nodes-layer')
+    if (nodeLayer.empty()) nodeLayer = g.append('g').attr('class','nodes-layer')
+
+    const nodeSel = nodeLayer.selectAll('g.node-group').data(allNodes, d => d.data.id)
+    nodeSel.exit().transition().duration(400).attr('opacity',0).remove()
+
+    const nodeEnter = nodeSel.enter().append('g').attr('class','node-group')
+      .attr('opacity',0)
+      .attr('transform', d => {
+        const p = d.parent ? posCache.current[d.parent.data.id] : null
+        return `translate(${p?.x??0},${p?.y??0})`
+      })
+      .style('cursor','pointer')
+      // Enhancement 8: single-click = select, double-click = expand/collapse
+      .on('click', (ev, d) => { ev.stopPropagation(); onNodeSelect(d.data) })
+      .on('dblclick', (ev, d) => {
+        ev.stopPropagation()
+        if (!d.data.hasChildren) return
+        if (d.data.children) onNodeCollapse(d.data.id)
+        else onNodeExpand(d.data.id)
+      })
+      .on('mouseenter', function(ev, d) { d3.select(this).raise(); showTip(ev, d) })
+      .on('mousemove', showTip)
+      .on('mouseleave', hideTip)
+
+    // Aura
+    nodeEnter.append('circle').attr('class','bubble-aura')
+      .attr('r', d => d.r+16).attr('fill', d => d.color).attr('opacity',0.07).attr('filter','url(#aura-blur)')
+
+    // Enhancement 9: hover expand-hint ring (CSS animated dashed ring)
+    nodeEnter.append('circle').attr('class','expand-hint-ring')
+      .attr('r', d => d.r+4)
+      .attr('fill','none').attr('stroke-width',1.5).attr('stroke-dasharray','6,4')
+      .attr('pointer-events','none')
+
+    // Main bubble
+    nodeEnter.append('circle').attr('class','bubble-base').attr('r', d => d.r).attr('stroke-width',2.5)
+
+    // Image collage setup – structure created on enter, images filled on merge
+    nodeEnter.each(function(d) {
+      const sel = d3.select(this)
+      const clipId = `iclip-${String(d.data.id).replace(/\W/g,'')}`
+      // Circular clip
+      sel.append('defs').append('clipPath').attr('id', clipId)
+        .append('circle').attr('class','img-clip-c').attr('r', d.r - 1.5)
+      // Collage container (zoom-dependent opacity handled in zoom handler)
+      sel.append('g').attr('class','img-layer collage-wrap').style('opacity', 0)
+        .attr('clip-path', `url(#${clipId})`)
+      // Glass shimmer on top of images
+      sel.append('circle').attr('class','bubble-glass').attr('r', d.r)
+        .attr('fill','url(#glass-gradient)').attr('pointer-events','none')
+      sel.append('text').attr('class','bubble-label').attr('text-anchor','middle').attr('pointer-events','none').style('opacity',0)
+      // Pulse ring
+      sel.append('circle').attr('class','pulse-ring')
+        .attr('r', d.r+6).attr('fill','none').attr('stroke-width',2).attr('pointer-events','none')
+    })
+
+    nodeEnter.transition().duration(700).ease(d3.easeCubicOut)
+      .attr('opacity',1).attr('transform', d => `translate(${d.x},${d.y})`)
+
+    const nodeAll = nodeEnter.merge(nodeSel)
+
+    // Update bubble base
+    nodeAll.select('.bubble-base')
+      .attr('r', d => d.r)
+      .attr('fill', d => d.data.id===selectedId ? '#fff' : (d.data.children ? hexToRgba(d.color,0.12) : d.color))
+      .attr('stroke', d => d.data.id===selectedId ? '#fff' : d.color)
+      // Enhancement 7: depth-based glow strength
+      .attr('filter', d => `url(#glow-d${Math.min(d.depth,3)})`)
+
+    // Enhancement 9: expand-hint ring styling
+    nodeAll.select('.expand-hint-ring')
+      .attr('stroke', d => d.data.hasChildren && !d.data.children ? d.color : 'none')
+      .classed('ring-pulse', d => d.data.hasChildren && !d.data.children)
+
+    // Enhancement 4: pulse ring for selected
+    nodeAll.select('.pulse-ring')
+      .attr('stroke', d => d.data.id===selectedId ? d.color : 'none')
+      .classed('selected-pulse', d => d.data.id===selectedId)
+
+    // Image Collage – rebuild inside each node based on available images
+    nodeAll.each(function(d) {
+      const sel      = d3.select(this)
+      const wrap     = sel.select('.collage-wrap')
+      const r        = d.r
+      // Gather images: prefer cladeMetaData gallery (up to 4), fall back to nodeIcons
+      const gallery  = cladeMetaData[d.data.id]?.images || []
+      const icon     = nodeIcons[d.data.id]
+      const imgs     = gallery.length ? gallery.slice(0, 4) : (icon ? [icon] : [])
+
+      // Clear previous collage tiles
+      wrap.selectAll('*').remove()
+
+      if (imgs.length === 0) return
+
+      const n = imgs.length
+
+      if (n === 1) {
+        // Full-circle fill
+        wrap.append('image')
+          .attr('xlink:href', imgs[0])
+          .attr('x', -r).attr('y', -r)
+          .attr('width', r*2).attr('height', r*2)
+          .attr('preserveAspectRatio', 'xMidYMid slice')
+
+      } else if (n === 2) {
+        // Left / Right split
+        imgs.forEach((url, i) => {
+          wrap.append('image')
+            .attr('xlink:href', url)
+            .attr('x', i === 0 ? -r : 0).attr('y', -r)
+            .attr('width', r).attr('height', r*2)
+            .attr('preserveAspectRatio', 'xMidYMid slice')
+        })
+        // Hairline divider
+        wrap.append('line').attr('x1', 0).attr('y1', -r).attr('x2', 0).attr('y2', r)
+          .attr('stroke', 'rgba(0,0,0,0.4)').attr('stroke-width', 1)
+
+      } else if (n === 3) {
+        // Top-left, top-right (half height), bottom (full width, half height)
+        wrap.append('image').attr('xlink:href', imgs[0])
+          .attr('x', -r).attr('y', -r).attr('width', r).attr('height', r)
+          .attr('preserveAspectRatio', 'xMidYMid slice')
+        wrap.append('image').attr('xlink:href', imgs[1])
+          .attr('x', 0).attr('y', -r).attr('width', r).attr('height', r)
+          .attr('preserveAspectRatio', 'xMidYMid slice')
+        wrap.append('image').attr('xlink:href', imgs[2])
+          .attr('x', -r).attr('y', 0).attr('width', r*2).attr('height', r)
+          .attr('preserveAspectRatio', 'xMidYMid slice')
+        // Dividers
+        wrap.append('line').attr('x1',-r).attr('y1',0).attr('x2',r).attr('y2',0)
+          .attr('stroke','rgba(0,0,0,0.4)').attr('stroke-width',1)
+        wrap.append('line').attr('x1',0).attr('y1',-r).attr('x2',0).attr('y2',0)
+          .attr('stroke','rgba(0,0,0,0.4)').attr('stroke-width',1)
+
+      } else {
+        // 2×2 quad grid (4 images)
+        imgs.forEach((url, i) => {
+          const col = i % 2, row = Math.floor(i / 2)
+          wrap.append('image').attr('xlink:href', url)
+            .attr('x', col === 0 ? -r : 0).attr('y', row === 0 ? -r : 0)
+            .attr('width', r).attr('height', r)
+            .attr('preserveAspectRatio', 'xMidYMid slice')
+        })
+        // Crosshair dividers
+        wrap.append('line').attr('x1',-r).attr('y1',0).attr('x2',r).attr('y2',0)
+          .attr('stroke','rgba(0,0,0,0.45)').attr('stroke-width',1.5)
+        wrap.append('line').attr('x1',0).attr('y1',-r).attr('x2',0).attr('y2',r)
+          .attr('stroke','rgba(0,0,0,0.45)').attr('stroke-width',1.5)
+      }
+    })
+
+    // Labels
+    nodeAll.select('.bubble-label')
+      .text(d => d.data.name)
+      .attr('dy', d => d.data.children ? -(d.r+20) : '0.35em')
+      .style('font-size', d => d.data.children ? `${Math.min(22,Math.max(11,d.r*0.22))}px` : `${labelConfig.fontSize}px`)
+      .style('font-weight','700').style('letter-spacing','0.04em')
+      .style('text-shadow','0 1px 8px rgba(0,0,0,1)').attr('fill','#fff')
+
+    // ── Enhancement 1+2: Force simulation ───────────────────────────────────
+    const sim = d3.forceSimulation(allNodes)
+      .force('link', d3.forceLink(allLinks).id(d => d.data.id)
+        .distance(d => d.source.r + d.target.r + 90).strength(0.85))
+      .force('charge', d3.forceManyBody().strength(d => d.data.children ? -2200 : -600))
+      .force('collide', d3.forceCollide().radius(d => d.r+28).iterations(4))
+      .force('radial', d3.forceRadial(d => d.depth===0 ? 0 : d.depth*420, 0, 0).strength(d => d.depth===0 ? 2 : 0.5))
+      .velocityDecay(0.65).alpha(0.6).alphaDecay(0.022)
+
+    simRef.current = sim
+
+    // Enhancement 6: update gradient coordinates every tick
+    const updateGradients = () => {
+      allLinks.forEach(lk => {
+        const grad = defsRef.current?.querySelector(`#${gradId(lk.source,lk.target)}`)
+        if (grad) {
+          grad.setAttribute('x1', lk.source.x); grad.setAttribute('y1', lk.source.y)
+          grad.setAttribute('x2', lk.target.x); grad.setAttribute('y2', lk.target.y)
+        }
+      })
     }
 
-    svg.on('click', () => onNodeSelect(null))
-  }, [onNodeSelect, onNodeExpand, onNodeCollapse, cladeMetaData, nodeIcons, labelConfig])
+    // Enhancement 2: quadratic bezier links
+    const linkPath = d => {
+      const mx = (d.source.x + d.target.x)/2, my = (d.source.y + d.target.y)/2
+      const dx = d.target.y - d.source.y, dy = d.source.x - d.target.x
+      const len = Math.sqrt(dx*dx+dy*dy)||1
+      const bend = 0.15
+      const cx = mx + dx/len*(d.source.r*bend), cy = my + dy/len*(d.source.r*bend)
+      return `M${d.source.x},${d.source.y} Q${cx},${cy} ${d.target.x},${d.target.y}`
+    }
 
-  // Keep ref always pointing at latest renderTree
-  renderTreeRef.current = renderTree
+    sim.on('tick', () => {
+      allNodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
+      updateGradients()
+      linkAll.attr('d', linkPath)
+      nodeAll.attr('transform', d => `translate(${d.x},${d.y})`)
+      // Keep nebulas centered on their parent
+      nebulaLayer.selectAll('circle.nebula').attr('cx', d => d.x||0).attr('cy', d => d.y||0)
+    })
 
-  // ── Re-render ──────────────────────────────────────────────────────────────
+    // Enhancement 10: auto-fit after simulation settles
+    sim.on('end', () => {
+      allNodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
+      autoFit(allNodes)
+    })
+
+  }, [onNodeSelect, onNodeExpand, onNodeCollapse, cladeMetaData, nodeIcons, labelConfig, autoFit])
+
   useEffect(() => {
-    if (!treeData || !gRef.current || !svgRef.current) return
-    renderTreeRef.current(treeData, selectedNodeId, compareNodes, mrcaInfo)
-  }, [treeData, selectedNodeId, compareNodes, mrcaInfo]) // eslint-disable-line
+    if (!treeData) return
+    renderTree(treeData, selectedNodeId)
+  }, [treeData, selectedNodeId, renderTree])
 
   return (
     <div className="tree-canvas-wrap">
-      {/* Tooltip */}
-      <div ref={tooltipRef} className="node-tooltip" style={{ opacity: 0 }} />
+      <div ref={tooltipRef} className="node-tooltip" style={{opacity:0}} />
 
-      {/* Legend */}
       <div className="tree-legend">
-        {Object.entries(CLADE_COLORS).filter(([k]) => k !== 'default').map(([name, color]) => (
+        <div className="legend-header">Domains of Life</div>
+        {Object.entries(CLADE_COLORS).filter(([k])=>k!=='default').map(([name,color])=>(
           <div key={name} className="legend-item">
-            <span className="legend-dot" style={{ background: color, boxShadow: `0 0 6px ${color}` }} />
+            <span className="legend-dot" style={{background:color,boxShadow:`0 0 8px ${color}80`}}/>
             <span className="legend-name">{name}</span>
           </div>
         ))}
       </div>
 
-      {/* Instructions */}
       <div className="tree-hint">
-        Click node to expand · Click again to select · Scroll to zoom · Drag to pan
+        Click to select · Double-click to expand/collapse · Scroll to zoom · Drag to pan
       </div>
 
       <svg ref={svgRef} className="tree-svg">
         <defs>
-          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-            <feGaussianBlur stdDeviation="3" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-          <filter id="strong-glow" x="-100%" y="-100%" width="300%" height="300%">
-            <feGaussianBlur stdDeviation="6" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-          <filter id="node-inner-glow">
-            <feComponentTransfer in="SourceAlpha">
-              <feFuncA type="table" tableValues="1 0" />
-            </feComponentTransfer>
-            <feGaussianBlur stdDeviation="1.5" />
-            <feOffset dx="0.5" dy="0.5" result="offsetblur" />
-            <feFlood floodColor="white" floodOpacity="0.4" result="color" />
-            <feComposite in2="offsetblur" operator="in" />
-            <feComposite in2="SourceAlpha" operator="in" />
-            <feMerge>
-              <feMergeNode in="SourceGraphic" />
-              <feMergeNode />
-            </feMerge>
-          </filter>
+          {/* Enhancement 7: depth-banded glows */}
+          {[0,1,2,3].map(d => (
+            <filter key={d} id={`glow-d${d}`} x="-50%" y="-50%" width="200%" height="200%">
+              <feDropShadow dx="0" dy="0" stdDeviation={10-d*2} floodColor="currentColor" floodOpacity={0.5-d*0.08}/>
+              <feDropShadow dx="0" dy="3" stdDeviation="6" floodColor="#000" floodOpacity="0.5"/>
+            </filter>
+          ))}
+          <filter id="aura-blur"><feGaussianBlur stdDeviation="18"/></filter>
           <radialGradient id="bg-gradient">
-            <stop offset="0%" stopColor="#0d1930" />
-            <stop offset="100%" stopColor="#020812" />
+            <stop offset="0%"   stopColor="#0D1B30"/>
+            <stop offset="100%" stopColor="#02060F"/>
           </radialGradient>
-
-          <radialGradient id="glass-gradient" cx="30%" cy="30%" r="70%">
-            <stop offset="0%" stopColor="rgba(255,255,255,0.4)" />
-            <stop offset="50%" stopColor="transparent" />
-            <stop offset="100%" stopColor="rgba(0,0,0,0.2)" />
+          <radialGradient id="glass-gradient" cx="28%" cy="22%" r="72%">
+            <stop offset="0%"   stopColor="rgba(255,255,255,0.55)"/>
+            <stop offset="40%"  stopColor="rgba(255,255,255,0.06)"/>
+            <stop offset="100%" stopColor="rgba(0,0,0,0.35)"/>
           </radialGradient>
+          <style>{`
+            .bubble-label { font-family: 'Exo 2', 'Outfit', sans-serif; user-select: none; }
+            .link-edge { transition: stroke-opacity 0.3s; }
 
-          <filter id="aura">
-            <feGaussianBlur stdDeviation="4" result="blur" />
-            <feComposite in="SourceGraphic" in2="blur" operator="over" />
-          </filter>
+            /* Enhancement 4: selected-node pulse ring */
+            @keyframes selected-pulse-anim {
+              0%   { r: attr(r); opacity: 0.9; stroke-width: 2.5; }
+              70%  { opacity: 0; stroke-width: 0.5; }
+              100% { opacity: 0; }
+            }
+            .selected-pulse { animation: selected-pulse-anim 1.8s ease-out infinite; }
 
-          {/* Dynamic Link Gradients will be added here via JS */}
-          <style>
-            {`
-              .link {
-                transition: stroke 0.8s, stroke-width 0.8s, opacity 0.8s;
-                stroke-linecap: round;
-              }
-              .link-flow {
-                stroke-dasharray: 6, 12;
-                animation: flow 15s linear infinite;
-              }
-              @keyframes flow {
-                from { stroke-dashoffset: 120; }
-                to { stroke-dashoffset: 0; }
-              }
-              .node-pulse {
-                animation: node-pulse-anim 4s ease-in-out infinite;
-              }
-              @keyframes node-pulse-anim {
-                0%, 100% { transform: scale(1); filter: brightness(1) drop-shadow(0 0 5px currentColor); }
-                50% { transform: scale(1.15); filter: brightness(1.4) drop-shadow(0 0 15px currentColor); }
-              }
-              .node-hover-aura {
-                fill: none;
-                stroke: currentColor;
-                stroke-width: 1;
-                filter: url(#aura);
-                opacity: 0;
-                transition: opacity 0.3s, r 0.3s;
-              }
-              .node:hover .node-hover-aura {
-                opacity: 0.5;
-                r: 25;
-              }
-            `}
-          </style>
+            /* Enhancement 9: hover expand-hint ring */
+            @keyframes ring-spin {
+              to { stroke-dashoffset: -40; }
+            }
+            .ring-pulse { animation: ring-spin 3s linear infinite; opacity: 0.5; }
+            .node-group:hover .ring-pulse { opacity: 1; }
+
+            /* Tooltip */
+            .node-tooltip {
+              position: fixed;
+              background: rgba(6,14,34,0.94);
+              backdrop-filter: blur(18px);
+              border: 1px solid rgba(255,255,255,0.1);
+              border-radius: 10px;
+              color: #fff;
+              padding: 12px 16px;
+              pointer-events: none;
+              z-index: 9999;
+              box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+              font-family: 'Exo 2', sans-serif;
+              min-width: 170px;
+              transition: opacity 0.12s;
+            }
+            .tt-name { font-weight: 800; font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
+            .tt-meta { font-size: 11px; opacity: 0.55; }
+            .tt-hint { font-size: 10px; margin-top: 7px; opacity: 0.35; font-style: italic; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 6px; }
+
+            .legend-header {
+              font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em;
+              color: var(--text-dim); margin-bottom: 6px; font-family: var(--mono);
+            }
+          `}</style>
         </defs>
-        <rect width="100%" height="100%" fill="url(#bg-gradient)" />
-        <g ref={gRef} />
+        <rect width="100%" height="100%" fill="url(#bg-gradient)"/>
+        <g ref={gRef}/>
       </svg>
     </div>
   )
-}
-
-function fmtNum(n) {
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`
-  return n.toString()
 }

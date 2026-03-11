@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { searchTaxa, fetchRandomTaxon } from '../api/otl'
+import { searchTaxa } from '../api/otl'
 
 function debounce(fn, ms) {
   let t
@@ -11,13 +11,12 @@ const RANK_ICONS = {
   class: '◉', phylum: '★', kingdom: '⬡', domain: '⬣',
 }
 
-export default function SearchBar({ onSelect }) {
+export default function SearchBar({ onSelect, onSurprise, surpriseLoading = false }) {
   const [query,    setQuery]    = useState('')
   const [results,  setResults]  = useState([])
   const [loading,  setLoading]  = useState(false)
   const [open,     setOpen]     = useState(false)
   const [focused,  setFocused]  = useState(0)
-  const [surprise, setSurprise] = useState(false)
   const inputRef = useRef(null)
   const dropRef  = useRef(null)
 
@@ -52,18 +51,9 @@ export default function SearchBar({ onSelect }) {
     if (e.key === 'Escape')    { setOpen(false) }
   }
 
-  const handleSurprise = async () => {
-    if (surprise) return
-    setSurprise(true)
-    try {
-      const taxon = await fetchRandomTaxon()
-      if (taxon) {
-        setQuery(taxon.name)
-        onSelect(taxon)
-      }
-    } finally {
-      setSurprise(false)
-    }
+  const handleSurprise = () => {
+    if (surpriseLoading) return
+    onSurprise?.()
   }
 
   // Keyboard shortcut: Ctrl+K / Cmd+K to focus search
@@ -106,10 +96,10 @@ export default function SearchBar({ onSelect }) {
         {loading && <span className="search-spinner" />}
         {query && <button className="search-clear" onClick={() => { setQuery(''); setResults([]); setOpen(false) }}>✕</button>}
         <button
-          className={`surprise-btn ${surprise ? 'surprise-loading' : ''}`}
+          className={`surprise-btn ${surpriseLoading ? 'surprise-loading' : ''}`}
           onClick={handleSurprise}
-          title="Discover a random organism"
-          disabled={surprise}
+          title="Discover a random organism — traces through the tree of life"
+          disabled={surpriseLoading}
         >
           🎲
         </button>

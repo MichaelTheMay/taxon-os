@@ -2,7 +2,9 @@ import { fetchXCRecordings } from './xenocanto'
 
 /**
  * SoundEngine — immersive audio for TaxonOS.
- * Uses Xeno-canto v2 API for real wildlife sounds.
+ * Uses Xeno-canto API v3 for real wildlife sounds.
+ * Requires VITE_XC_API_KEY in .env — get a free key at xeno-canto.org.
+ * Without a key, ambient rain audio still plays; taxon-specific sounds are skipped.
  */
 
 class SoundEngine {

@@ -48,15 +48,25 @@ export default function TaxonPanel({
   
   const panelRef = useRef(null)
 
+  const loadTimerRef = useRef(null)
+
   useEffect(() => {
     if (!node) return
     loadAll(node)
     setActiveImg(0)
     setTab('overview')
+    
+    // Cleanup if component unmounts
+    return () => {
+      if (loadTimerRef.current) clearTimeout(loadTimerRef.current)
+    }
   }, [node?.id])
 
   async function loadAll(node) {
+    if (loadTimerRef.current) clearTimeout(loadTimerRef.current)
     setLoading(true)
+    
+    // Clear heavy secondary data immediately
     setWiki(null); setImages([]); setGbif(null); setInat(null)
     setOccCount(null); setOccPoints([]); setProfile(null)
     setYearlyData([]); setLineage([]); setInatObs([])
@@ -65,61 +75,72 @@ export default function TaxonPanel({
 
     const name = node.name
 
-    // NEW ROBUST AGGREGATION: Resolve IDs first via Crosswalk Cache
+    // ── PHASE 1: Immediate Lightweight Core (Lineage & IDs) ──
     const ids = await resolveTaxonIDs(name)
-
-    // Phase 1: Core metadata and summaries
-    const [wikiRes, gbifRes, inatRes, lineageRes] = await Promise.allSettled([
-      fetchWikiSummary(name),
-      ids.gbifKey ? fetchGBIFSpecies(ids.gbifKey) : matchGBIF(name),
-      ids.inatId ? fetchInatTaxonByID(ids.inatId) : fetchInatTaxon(name),
-      node.ott_id ? fetchLineage(node.ott_id) : Promise.resolve([]),
-    ])
-
-    if (wikiRes.status === 'fulfilled') setWiki(wikiRes.value)
-    if (inatRes.status === 'fulfilled') setInat(inatRes.value)
-    if (lineageRes.status === 'fulfilled') setLineage(lineageRes.value)
-
-    // Phase 2: GBIF-dependent data (Occurrences and Species Profile)
-    const gData = gbifRes.status === 'fulfilled' ? gbifRes.value : null
-    if (gData?.usageKey || gData?.key) {
-      const gKey = gData.usageKey || gData.key
-      setGbif(gData)
-
-      const [imgs, cnt, prof, yearly] = await Promise.allSettled([
-        fetchOccurrenceImages(gKey, 12),
-        fetchOccurrenceCount(gKey),
-        fetchSpeciesProfile(gKey),
-        fetchYearlyOccurrences(gKey),
-      ])
-      if (imgs.status === 'fulfilled') setImages(imgs.value)
-      if (cnt.status === 'fulfilled') setOccCount(cnt.value)
-      if (prof.status === 'fulfilled') setProfile(prof.value)
-      if (yearly.status === 'fulfilled') setYearlyData(yearly.value)
+    
+    if (node.ott_id) {
+      fetchLineage(node.ott_id).then(setLineage).catch(() => setLineage([]))
     }
-
-    // Phase 3: iNat observations
-    const iData = inatRes.status === 'fulfilled' ? inatRes.value : null
-    if (iData?.id) {
-      const obsRes = await fetchInatObservations(iData.id, 12).catch(() => [])
-      setInatObs(obsRes)
-    }
-
-    // Phase 4: Non-blocking data (Genome, Facts, Sound excerpts)
-    // Here we leverage the resolved IDs again
-    Promise.allSettled([
-      fetchWikidataQuickFacts(name),
-      ids.eolId ? fetchEOLPage(ids.eolId) : fetchEOLData(name),
-      fetchXCRecordings(name, 5),
-      fetchNCBIGenome(name),
-    ]).then(([wdRes, eolRes, xcRes, ncbiRes]) => {
-      if (wdRes.status === 'fulfilled') setWikidata(wdRes.value)
-      if (eolRes.status === 'fulfilled') setEol(eolRes.value)
-      if (xcRes.status === 'fulfilled') setXcRecordings(xcRes.value)
-      if (ncbiRes.status === 'fulfilled') setGenome(ncbiRes.value)
-    })
 
     setLoading(false)
+
+    // ── PHASE 2: Heavy Delayed Fetching (Lazy Load) ──
+    // If user interacts (clicks another node) within 1200ms, these never run, 
+    // freeing up the network for the core TreeCanvas operations.
+    loadTimerRef.current = setTimeout(async () => {
+      // Background loading indicator logic could go here if needed,
+      // but usually the panel just populates silently.
+
+      const [wikiRes, gbifRes, inatRes] = await Promise.allSettled([
+        fetchWikiSummary(name),
+        ids.gbifKey ? fetchGBIFSpecies(ids.gbifKey) : matchGBIF(name),
+        ids.inatId ? fetchInatTaxonByID(ids.inatId) : fetchInatTaxon(name),
+      ])
+
+      if (wikiRes.status === 'fulfilled') setWiki(wikiRes.value)
+      if (inatRes.status === 'fulfilled') setInat(inatRes.value)
+
+      // GBIF-dependent data (Occurrences and Species Profile)
+      const gData = gbifRes.status === 'fulfilled' ? gbifRes.value : null
+      if (gData?.usageKey || gData?.key) {
+        const gKey = gData.usageKey || gData.key
+        setGbif(gData)
+
+        Promise.allSettled([
+          fetchOccurrenceImages(gKey, 12),
+          fetchOccurrenceCount(gKey),
+          fetchSpeciesProfile(gKey),
+          fetchYearlyOccurrences(gKey),
+        ]).then(([imgs, cnt, prof, yearly]) => {
+          if (imgs.status === 'fulfilled') setImages(imgs.value)
+          if (cnt.status === 'fulfilled') setOccCount(cnt.value)
+          if (prof.status === 'fulfilled') setProfile(prof.value)
+          if (yearly.status === 'fulfilled') setYearlyData(yearly.value)
+        })
+      }
+
+      // iNat observations
+      const iData = inatRes.status === 'fulfilled' ? inatRes.value : null
+      if (iData?.id) {
+        fetchInatObservations(iData.id, 12).then(obsRes => {
+          setInatObs(obsRes)
+        }).catch(() => [])
+      }
+
+      // Non-blocking data (Genome, Facts, Sound excerpts)
+      Promise.allSettled([
+        fetchWikidataQuickFacts(name),
+        ids.eolId ? fetchEOLPage(ids.eolId) : fetchEOLData(name),
+        fetchXCRecordings(name, 5),
+        fetchNCBIGenome(name),
+      ]).then(([wdRes, eolRes, xcRes, ncbiRes]) => {
+        if (wdRes.status === 'fulfilled') setWikidata(wdRes.value)
+        if (eolRes.status === 'fulfilled') setEol(eolRes.value)
+        if (xcRes.status === 'fulfilled') setXcRecordings(xcRes.value)
+        if (ncbiRes.status === 'fulfilled') setGenome(ncbiRes.value)
+      })
+
+    }, 1200) // 1.2 second debounce before hitting secondary APIs
   }
 
   // Load occurrence points when switching to map tab

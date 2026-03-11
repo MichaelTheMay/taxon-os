@@ -1304,3 +1304,25 @@ html, body, #root {
 }
 .stop-btn:hover { background: var(--danger); color: white; }
 
+/* ── Specimen Bubble & Mag Collage Popup ──────────────────────── */
+.mag-cllg {
+  opacity: 0.15;
+  transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  pointer-events: none;
+}
+.node-group:hover > .mag-cllg {
+  opacity: 1;
+  transform: scale(1.6) translateY(-10px);
+}
+.polaroid rect {
+  transition: fill 0.4s;
+}
+.node-group:hover > .mag-cllg .polaroid rect {
+  fill: #fafafa;
+}
+.bubble-base {
+  transition: fill 0.4s, opacity 0.4s, filter 0.4s;
+}
+.node-group:hover > .bubble-base {
+  filter: drop-shadow(0 0 15px rgba(255,255,255,0.4)) brightness(1.2) !important;
+}

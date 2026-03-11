@@ -108,7 +108,7 @@ export default function App() {
         }
       }).filter(Boolean)
 
-      setTree({
+      const rootNode = {
         id: 'life-root',
         name: 'Life',
         rank: 'root',
@@ -117,7 +117,29 @@ export default function App() {
         children: seedNodes,
         _loading: false,
         isRoot: true,
-      })
+      }
+      setTree(rootNode)
+
+      // Prefetch images for root and initial seeds
+      const initialNodes = [rootNode, ...seedNodes]
+      ;(async () => {
+        await Promise.allSettled(initialNodes.map(async (child) => {
+          try {
+            const imgs = await fetchCladeImagery(child.name)
+            if (imgs.length > 0) {
+              setCladeMetaData(prev => {
+                if (prev[child.id]) return prev
+                return { ...prev, [child.id]: { name: child.name, images: imgs } }
+              })
+              setNodeIcons(prev => {
+                if (prev[child.id]) return prev
+                return { ...prev, [child.id]: imgs[0] }
+              })
+            }
+          } catch (_) {}
+        }))
+      })()
+
     } catch (err) {
       console.error(err)
       setBootError(err.message)
@@ -170,25 +192,29 @@ export default function App() {
         })
       }
 
-      // Background-prefetch gallery images for every newly added child node
-      // so the in-node collage can display immediately when the user zooms in.
-      // Stagger requests slightly (50ms apart) to avoid hammering GBIF.
-      childNodes.forEach((child, i) => {
-        setTimeout(() => {
-          fetchCladeImagery(child.name).then(imgs => {
-            if (imgs.length > 0) {
-              setCladeMetaData(prev => {
-                if (prev[child.id]) return prev   // already fetched, skip
-                return { ...prev, [child.id]: { name: child.name, images: imgs } }
-              })
-              setNodeIcons(prev => {
-                if (prev[child.id]) return prev
-                return { ...prev, [child.id]: imgs[0] }
-              })
-            }
-          }).catch(() => {/* silently ignore per-child fetch errors */})
-        }, i * 60)   // 60ms stagger per child = gentle on rate limits
-      })
+      // Background-prefetch gallery images for newly added child nodes in parallel chunks.
+      // We chunk by 5 to fetch them as fast as possible without triggering 429 Too Many Requests.
+      ;(async () => {
+        const chunkSize = 5
+        for (let i = 0; i < childNodes.length; i += chunkSize) {
+          const chunk = childNodes.slice(i, i + chunkSize)
+          await Promise.allSettled(chunk.map(async (child) => {
+            try {
+              const imgs = await fetchCladeImagery(child.name)
+              if (imgs.length > 0) {
+                setCladeMetaData(prev => {
+                  if (prev[child.id]) return prev
+                  return { ...prev, [child.id]: { name: child.name, images: imgs } }
+                })
+                setNodeIcons(prev => {
+                  if (prev[child.id]) return prev
+                  return { ...prev, [child.id]: imgs[0] }
+                })
+              }
+            } catch (_) {}
+          }))
+        }
+      })()
     } catch (err) {
       console.error('Expand failed:', err)
       setTree(prev => updateNode(prev, nodeId, { _loading: false }))
@@ -507,9 +533,8 @@ export default function App() {
     if (!node.children) return 1
     return 1 + node.children.reduce((s, c) => s + countNodes(c), 0)
   }
-
   const visibleNodes = tree ? countNodes(tree) : 0
-
+  console.log('CLADE META', Object.keys(cladeMetaData).length, cladeMetaData);
   return (
     <div className="app">
       {/* Header */}

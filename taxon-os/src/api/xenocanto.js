@@ -20,11 +20,14 @@ export async function fetchXCRecordings(scientificName, limit = 3) {
 
   try {
     const parts = scientificName.trim().split(/\s+/)
-    // Build tag query: gen:Turdus sp:merula  (most precise)
-    // If only one word, use it as a general name query
-    const query = parts.length >= 2
-      ? `gen:${parts[0]} sp:${parts[1]} q:A`
-      : `${scientificName} q:A`
+    let query = ''
+    if (parts.length === 1) {
+      query = `gen:${parts[0]} q:A`
+    } else if (parts.length === 2) {
+      query = `gen:${parts[0]} sp:${parts[1]} q:A`
+    } else {
+      query = `gen:${parts[0]} sp:${parts[1]} ssp:${parts[2]} q:A`
+    }
 
     const url = `${XC_BASE}?query=${encodeURIComponent(query)}&key=${encodeURIComponent(XC_KEY)}&per_page=50`
     const res = await fetch(url)

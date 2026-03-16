@@ -10,6 +10,7 @@ import { fetchXCRecordings } from '../api/xenocanto'
 import { fetchNCBIGenome, formatGenomeSize } from '../api/ncbi'
 import { resolveTaxonIDs } from '../api/TaxonResolver'
 import OccurrenceMap from './OccurrenceMap'
+import { fmtNum, truncate, stripHtml } from '../utils/format'
 
 const TABS = [
   { id: 'overview', label: 'Overview', icon: '📋' },
@@ -75,11 +76,26 @@ export default function TaxonPanel({
 
     const name = node.name
 
-    // ── PHASE 1: Immediate Lightweight Core (Lineage & IDs) ──
-    const ids = await resolveTaxonIDs(name)
-    
+    // ── PHASE 1: Fetch lineage FIRST to get kingdom for cross-validation ──
+    let nodeLineage = []
     if (node.ott_id) {
-      fetchLineage(node.ott_id).then(setLineage).catch(() => setLineage([]))
+      try {
+        nodeLineage = await fetchLineage(node.ott_id)
+        setLineage(nodeLineage)
+      } catch {
+        setLineage([])
+      }
+    }
+
+    // Extract kingdom from lineage (OTL is ground truth)
+    const kingdom = nodeLineage.find(item => item.rank === 'kingdom')?.name || null
+
+    // Resolve IDs with kingdom context to prevent cross-kingdom mismatches
+    let ids = {}
+    try {
+      ids = await resolveTaxonIDs(name, { kingdom })
+    } catch (err) {
+      console.warn('TaxonResolver failed:', err)
     }
 
     setLoading(false)
@@ -160,7 +176,8 @@ export default function TaxonPanel({
   const inatPhotos = inat?.taxon_photos?.map(p => p.photo?.medium_url).filter(Boolean) || []
   const inatObsPhotos = inatObs.map(o => o.photo).filter(Boolean)
   const gbifPhotos = images.map(i => i.url)
-  const allImages = [...new Set([...inatPhotos, ...inatObsPhotos, ...gbifPhotos])]
+  // GBIF images first — they're tied to a validated usageKey and more reliable
+  const allImages = [...new Set([...gbifPhotos, ...inatPhotos, ...inatObsPhotos])]
   const heroImage = allImages[activeImg] || inat?.default_photo?.medium_url || wiki?.thumbnail?.source
 
   const commonName = profile?.commonName || inat?.preferred_common_name || null
@@ -331,7 +348,7 @@ export default function TaxonPanel({
             {/* iNat summary fallback */}
             {inat?.wikipedia_summary && !wiki?.extract && (
               <section className="panel-section">
-                <p className="extract-text">{truncate(inat.wikipedia_summary, 400)}</p>
+                <p className="extract-text">{truncate(stripHtml(inat.wikipedia_summary), 400)}</p>
               </section>
             )}
 
@@ -440,7 +457,7 @@ export default function TaxonPanel({
                 {eol.articles.map((a, i) => (
                   <div key={i} className="eol-article">
                     {a.type && <span className="eol-article-type">{a.type}</span>}
-                    <p className="extract-text">{truncate(a.text, 400)}</p>
+                    <p className="extract-text">{truncate(stripHtml(a.text), 400)}</p>
                   </div>
                 ))}
               </section>
@@ -583,14 +600,4 @@ function Sparkline({ data }) {
   )
 }
 
-function truncate(str, n) {
-  if (!str || str.length <= n) return str
-  return str.slice(0, str.lastIndexOf(' ', n)) + '…'
-}
-
-function fmtNum(n) {
-  if (!n) return '0'
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`
-  return n.toString()
-}
+// Shared utilities imported from utils/format.js at top of file

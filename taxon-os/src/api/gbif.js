@@ -1,8 +1,11 @@
 const BASE = 'https://api.gbif.org/v1'
 
-export async function matchGBIF(name) {
+export async function matchGBIF(name, opts = {}) {
   try {
-    const res = await fetch(`${BASE}/species/match?name=${encodeURIComponent(name)}&verbose=true`)
+    let url = `${BASE}/species/match?name=${encodeURIComponent(name)}&verbose=true`
+    // Scope to kingdom if provided (prevents cross-kingdom mismatches)
+    if (opts.kingdom) url += `&kingdom=${encodeURIComponent(opts.kingdom)}`
+    const res = await fetch(url)
     if (!res.ok) return null
     const data = await res.json()
     if (data.matchType === 'NONE') {

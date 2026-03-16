@@ -1,0 +1,20 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/proxy" },
+    { "source": "/otl-api/:path*", "destination": "/api/proxy?target=otl&path=/:path*" },
+    { "source": "/xc-api/:path*", "destination": "/api/proxy?target=xc&path=/:path*" }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET,POST,OPTIONS" },
+        { "key": "Access-Control-Allow-Headers", "value": "Content-Type" }
+      ]
+    }
+  ]
+}

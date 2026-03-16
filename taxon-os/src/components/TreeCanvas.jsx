@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback } from 'react'
 import * as d3 from 'd3'
+import { fmtNum } from '../utils/format'
 
 // ── Color palette ────────────────────────────────────────────────────────────
 const CLADE_COLORS = {
@@ -27,12 +28,6 @@ function hexToRgba(hex, a) {
   return `rgba(${r},${g},${b},${a})`
 }
 
-function fmtNum(n) {
-  if (n >= 1e6) return `${(n/1e6).toFixed(1)}M`
-  if (n >= 1e3) return `${(n/1e3).toFixed(0)}K`
-  return String(n||0)
-}
-
 function nodeRadius(d) {
   const t = d.data.num_tips || 1
   if (d.depth === 0) return 88
@@ -40,12 +35,6 @@ function nodeRadius(d) {
   return Math.max(16, Math.min(50, 9 + Math.log10(t+2)*12))
 }
 
-// ── Enhancement 6: gradient ID per link ─────────────────────────────────────
-function gradId(src, tgt) {
-  return `lg-${String(src.data.id).replace(/\W/g,'')}-${String(tgt.data.id).replace(/\W/g,'')}`
-}
-
-// ── Enhancement 10: compute bounding box of all nodes ───────────────────────
 function boundingBox(nodes) {
   let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity
   nodes.forEach(d => {
@@ -59,34 +48,76 @@ function boundingBox(nodes) {
 // ────────────────────────────────────────────────────────────────────────────
 export default function TreeCanvas({
   treeData, selectedNodeId,
-  cladeMetaData={}, nodeIcons={},
   labelConfig={fontSize:12,fontWeight:'normal'},
   onNodeSelect, onNodeExpand, onNodeCollapse,
 }) {
-  const svgRef     = useRef(null)
-  const gRef       = useRef(null)
-  const zoomRef    = useRef(null)
-  const simRef     = useRef(null)
-  const tooltipRef = useRef(null)
-  const posCache   = useRef({})
-  const defsRef    = useRef(null)
+  const svgRef       = useRef(null)
+  const gRef         = useRef(null)
+  const zoomRef      = useRef(null)
+  const simRef       = useRef(null)
+  const tooltipRef   = useRef(null)
+  const posCache     = useRef({})
+  const prevNodeIds  = useRef(new Set())
+  const labelElsRef  = useRef([])
+  const nodeLayerRef = useRef(null)
+  const linkLayerRef = useRef(null)
+  // LOD hull system: Map<cladeId, { path, color, label, numTips, childIds }>
+  const hullsRef     = useRef(new Map())
+  const hullLayerRef = useRef(null)
+  // Track all hierarchy nodes for hull computation
+  const allNodesRef  = useRef([])
 
-  // ── Zoom setup (Enhancement 3: zoom-banded image reveal) ─────────────────
+  // ── Zoom setup ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!svgRef.current) return
     const svg = d3.select(svgRef.current)
     const zoom = d3.zoom().scaleExtent([0.015, 18])
       .on('zoom', ({ transform: t }) => {
         d3.select(gRef.current).attr('transform', t)
-        // Enhancement 3: images fade in as you zoom
-        const imgOpacity = Math.min(1, Math.max(0, (t.k - 0.7) * 1.6))
-        d3.select(gRef.current).selectAll('.img-layer').style('opacity', imgOpacity)
-        // Labels: clades visible early, leaves only when zoomed in
-        d3.select(gRef.current).selectAll('.bubble-label').style('opacity', d => {
-          if (!d) return 0
-          if (d.data.children) return t.k > 0.2 ? 1 : 0
-          return t.k > 1.0 ? 1 : 0
-        })
+
+        // LOD: hull/node visibility based on zoom scale
+        //   scale < 0.3:  hulls=1, child nodes=0
+        //   0.3–1.0:      interpolate
+        //   scale > 1.0:  hulls=0, child nodes=1
+        const hulls = hullsRef.current
+        const hasHulls = hulls.size > 0
+        const hullChildIds = hasHulls ? new Set() : null
+        if (hasHulls) {
+          hulls.forEach(h => h.childIds.forEach(id => hullChildIds.add(id)))
+        }
+
+        const hullOpacity = hasHulls
+          ? t.k < 0.3 ? 1 : t.k > 1.0 ? 0 : 1 - (t.k - 0.3) / 0.7
+          : 0
+        const childOpacity = hasHulls
+          ? t.k < 0.3 ? 0 : t.k > 1.0 ? 1 : (t.k - 0.3) / 0.7
+          : 1
+
+        // Update hull layer visibility
+        if (hullLayerRef.current) {
+          hullLayerRef.current.style('opacity', hullOpacity)
+        }
+
+        // Update label + node visibility
+        const labels = labelElsRef.current
+        for (let i = 0; i < labels.length; i++) {
+          const el = labels[i]
+          const d = el.__data__
+          if (!d) continue
+          // If this node is inside a hull cluster, use LOD opacity
+          if (hasHulls && hullChildIds.has(d.data.id)) {
+            el.style.opacity = childOpacity * (d.data.children ? (t.k > 0.2 ? 1 : 0) : (t.k > 1.0 ? 1 : 0))
+          } else {
+            el.style.opacity = d.data.children ? (t.k > 0.2 ? 1 : 0) : (t.k > 1.0 ? 1 : 0)
+          }
+          // Also fade the parent node-group for LOD children
+          const group = el.parentNode
+          if (hasHulls && hullChildIds.has(d.data.id) && group) {
+            group.style.opacity = childOpacity
+          } else if (group) {
+            group.style.opacity = ''
+          }
+        }
       })
     svg.call(zoom)
     zoomRef.current = zoom
@@ -107,12 +138,36 @@ export default function TreeCanvas({
       .call(zoomRef.current.transform, d3.zoomIdentity.translate(width/2 - cx*scale, height/2 - cy*scale).scale(scale))
   }, [])
 
-  const renderTree = useCallback((data, selectedId) => {
-    if (!data || !gRef.current) return
-    if (simRef.current) { simRef.current.stop(); simRef.current = null }
+  // ── Tooltip (XSS-safe) ─────────────────────────────────────────────────────
+  const showTipRef = useRef(null)
+  const hideTipRef = useRef(null)
+  useEffect(() => {
+    const tip = d3.select(tooltipRef.current)
+    showTipRef.current = (ev, d) => {
+      tip.style('opacity',1)
+        .style('left',`${ev.clientX+18}px`).style('top',`${ev.clientY-36}px`)
+      tip.selectAll('*').remove()
+      tip.append('div').attr('class','tt-name')
+        .style('border-left',`3px solid ${d.color}`).style('padding-left','8px')
+        .text(d.data.name)
+      tip.append('div').attr('class','tt-meta')
+        .text(`${d.data.rank} · ${fmtNum(d.data.num_tips)} species`)
+      if (d.data.hasChildren && !d.data.children)
+        tip.append('div').attr('class','tt-hint').text('Double-click to expand')
+      if (d.data.children)
+        tip.append('div').attr('class','tt-hint').text('Double-click to collapse')
+    }
+    hideTipRef.current = () => tip.style('opacity',0)
+  }, [])
 
-    const g   = d3.select(gRef.current)
-    const svg = d3.select(svgRef.current)
+  // ── Core render: incremental simulation ────────────────────────────────────
+  //
+  //  First call: full build (create sim, all SVG, all forces)
+  //  Subsequent: diff nodes, enter new / exit removed, gentle sim restart
+  //
+  const renderTree = useCallback((data) => {
+    if (!data || !gRef.current) return
+    const g = d3.select(gRef.current)
 
     const root     = d3.hierarchy(data, d => d.children?.length ? d.children : null)
     const allNodes = root.descendants()
@@ -130,84 +185,45 @@ export default function TreeCanvas({
       } else { d.x = d.x??0; d.y = d.y??0 }
     })
 
-    // ── Enhancement 1: Pin root ──────────────────────────────────────────────
+    // Pin root
     const rootNode = allNodes[0]
     rootNode.fx = 0; rootNode.fy = 0
 
-    // ── Enhancement 6: linearGradients per link ──────────────────────────────
-    const svgElem = svgRef.current
-    let defsElem = svgElem.querySelector('defs#dynamic-defs')
-    if (!defsElem) {
-      defsElem = document.createElementNS('http://www.w3.org/2000/svg','defs')
-      defsElem.id = 'dynamic-defs'
-      svgElem.appendChild(defsElem)
-    }
-    defsRef.current = defsElem
-    allLinks.forEach(lk => {
-      const id = gradId(lk.source, lk.target)
-      if (!defsElem.querySelector(`#${id}`)) {
-        const grad = document.createElementNS('http://www.w3.org/2000/svg','linearGradient')
-        grad.id = id; grad.setAttribute('gradientUnits','userSpaceOnUse')
-        const s1 = document.createElementNS('http://www.w3.org/2000/svg','stop')
-        s1.setAttribute('offset','0%'); s1.setAttribute('stop-color', lk.source.color)
-        const s2 = document.createElementNS('http://www.w3.org/2000/svg','stop')
-        s2.setAttribute('offset','100%'); s2.setAttribute('stop-color', lk.target.color)
-        grad.appendChild(s1); grad.appendChild(s2)
-        defsElem.appendChild(grad)
-      }
-    })
+    // Compute diff
+    const newIds = new Set(allNodes.map(d => d.data.id))
+    const oldIds = prevNodeIds.current
+    const addedCount = [...newIds].filter(id => !oldIds.has(id)).length
+    const removedCount = [...oldIds].filter(id => !newIds.has(id)).length
+    const isFirstRender = oldIds.size === 0
+    const isMajorChange = (addedCount + removedCount) > 0.5 * Math.max(newIds.size, oldIds.size)
+    prevNodeIds.current = newIds
 
-    // ── Tooltip ──────────────────────────────────────────────────────────────
-    const tip = d3.select(tooltipRef.current)
-    const showTip = (ev, d) => tip.style('opacity',1)
-      .style('left',`${ev.clientX+18}px`).style('top',`${ev.clientY-36}px`)
-      .html(`
-        <div class="tt-name" style="border-left:3px solid ${d.color};padding-left:8px">${d.data.name}</div>
-        <div class="tt-meta">${d.data.rank} · <b>${fmtNum(d.data.num_tips)}</b> species</div>
-        ${d.data.hasChildren && !d.data.children ? '<div class="tt-hint">Double-click to expand</div>' : ''}
-        ${d.data.children ? '<div class="tt-hint">Double-click to collapse</div>' : ''}
-      `)
-    const hideTip = () => tip.style('opacity',0)
-
-    // ── Links layer ──────────────────────────────────────────────────────────
+    // ── Layers (order: links → hulls → nodes) ──
     let linkLayer = g.select('.links-layer')
     if (linkLayer.empty()) linkLayer = g.append('g').attr('class','links-layer')
+    let hullLayer = g.select('.hull-layer')
+    if (hullLayer.empty()) hullLayer = g.append('g').attr('class','hull-layer')
+    let nodeLayer = g.select('.nodes-layer')
+    if (nodeLayer.empty()) nodeLayer = g.append('g').attr('class','nodes-layer')
+    linkLayerRef.current = linkLayer
+    hullLayerRef.current = d3.select(hullLayer.node())
+    nodeLayerRef.current = nodeLayer
+    allNodesRef.current = allNodes
 
-    // Enhancement 5: nebula backgrounds behind expanded clades
-    let nebulaLayer = g.select('.nebula-layer')
-    if (nebulaLayer.empty()) nebulaLayer = g.insert('g','.links-layer').attr('class','nebula-layer')
-
-    const nebs = nebulaLayer.selectAll('circle.nebula').data(
-      allNodes.filter(d => d.depth > 0 && d.data.children),
-      d => d.data.id
-    )
-    nebs.exit().transition().duration(600).attr('r',0).attr('opacity',0).remove()
-    nebs.enter().append('circle').attr('class','nebula')
-      .attr('r',0).attr('opacity',0)
-      .merge(nebs)
-      .transition().duration(900)
-      .attr('r', d => d.r * 4.5)
-      .attr('fill', d => hexToRgba(d.color, 0.04))
-      .attr('filter','url(#aura-blur)')
-
-    // Link paths
+    // ── Links: solid color, no gradients ──
     const linkSel = linkLayer.selectAll('path.link-edge')
       .data(allLinks, d => `${d.source.data.id}--${d.target.data.id}`)
-    linkSel.exit().transition().duration(400).attr('opacity',0).remove()
+    linkSel.exit().transition().duration(300).attr('opacity',0).remove()
     const linkEnter = linkSel.enter().append('path').attr('class','link-edge')
       .attr('fill','none').attr('stroke-opacity',0).attr('stroke-linecap','round')
     const linkAll = linkEnter.merge(linkSel)
-      .attr('stroke', d => `url(#${gradId(d.source, d.target)})`)
-      // Enhancement 2: taper by depth
+      .attr('stroke', d => d.source.color)
       .attr('stroke-width', d => Math.max(1, 5 - d.source.depth * 1.0))
-    linkAll.transition().duration(500).attr('stroke-opacity', 0.55)
+    linkAll.transition().duration(400).attr('stroke-opacity', 0.55)
 
-    // ── Node layer ───────────────────────────────────────────────────────────
-    let nodeLayer = g.select('.nodes-layer')
-    if (nodeLayer.empty()) nodeLayer = g.append('g').attr('class','nodes-layer')
-
+    // ── Nodes: minimal SVG elements, no filters ──
     const nodeSel = nodeLayer.selectAll('g.node-group').data(allNodes, d => d.data.id)
-    nodeSel.exit().transition().duration(400).attr('opacity',0).remove()
+    nodeSel.exit().transition().duration(300).attr('opacity',0).remove()
 
     const nodeEnter = nodeSel.enter().append('g').attr('class','node-group')
       .attr('opacity',0)
@@ -216,7 +232,6 @@ export default function TreeCanvas({
         return `translate(${p?.x??0},${p?.y??0})`
       })
       .style('cursor','pointer')
-      // Enhancement 8: single-click = select, double-click = expand/collapse
       .on('click', (ev, d) => { ev.stopPropagation(); onNodeSelect(d.data) })
       .on('dblclick', (ev, d) => {
         ev.stopPropagation()
@@ -224,168 +239,36 @@ export default function TreeCanvas({
         if (d.data.children) onNodeCollapse(d.data.id)
         else onNodeExpand(d.data.id)
       })
-      .on('mouseenter', function(ev, d) { d3.select(this).raise(); showTip(ev, d) })
-      .on('mousemove', showTip)
-      .on('mouseleave', hideTip)
+      .on('mouseenter', function(ev, d) { d3.select(this).raise(); showTipRef.current?.(ev, d) })
+      .on('mousemove', (ev, d) => showTipRef.current?.(ev, d))
+      .on('mouseleave', () => hideTipRef.current?.())
 
-    // Aura
-    nodeEnter.append('circle').attr('class','bubble-aura')
-      .attr('r', d => d.r+16).attr('fill', d => d.color).attr('opacity',0.07).attr('filter','url(#aura-blur)')
-
-    // Enhancement 9: hover expand-hint ring (CSS animated dashed ring)
+    // Expand-hint ring
     nodeEnter.append('circle').attr('class','expand-hint-ring')
       .attr('r', d => d.r+4)
       .attr('fill','none').attr('stroke-width',1.5).attr('stroke-dasharray','6,4')
       .attr('pointer-events','none')
 
-    // Main bubble
+    // Main bubble — NO filter
     nodeEnter.append('circle').attr('class','bubble-base').attr('r', d => d.r).attr('stroke-width',2.5)
 
-    // Image collage setup – structure created on enter, images filled on merge
-    nodeEnter.each(function(d) {
-      const sel = d3.select(this)
-      const clipId = `iclip-${String(d.data.id).replace(/\W/g,'')}`
-      // Circular clip
-      sel.append('defs').append('clipPath').attr('id', clipId)
-        .append('circle').attr('class','img-clip-c').attr('r', d.r - 1.5)
-      // Collage container (zoom-dependent opacity handled in zoom handler)
-      sel.append('g').attr('class','img-layer collage-wrap').style('opacity', 0)
-        .attr('clip-path', `url(#${clipId})`)
-      // Glass shimmer on top of images
-      sel.append('circle').attr('class','bubble-glass').attr('r', d.r)
-        .attr('fill','url(#glass-gradient)').attr('pointer-events','none')
-      sel.append('text').attr('class','bubble-label').attr('text-anchor','middle').attr('pointer-events','none').style('opacity',0)
-      // Pulse ring
-      sel.append('circle').attr('class','pulse-ring')
-        .attr('r', d.r+6).attr('fill','none').attr('stroke-width',2).attr('pointer-events','none')
-    })
+    // Label
+    nodeEnter.append('text').attr('class','bubble-label').attr('text-anchor','middle')
+      .attr('pointer-events','none').style('opacity',0)
 
-    nodeEnter.transition().duration(700).ease(d3.easeCubicOut)
+    // Pulse ring (selected only)
+    nodeEnter.append('circle').attr('class','pulse-ring')
+      .attr('r', d => d.r+6).attr('fill','none').attr('stroke-width',2).attr('pointer-events','none')
+
+    nodeEnter.transition().duration(500).ease(d3.easeCubicOut)
       .attr('opacity',1).attr('transform', d => `translate(${d.x},${d.y})`)
 
     const nodeAll = nodeEnter.merge(nodeSel)
 
-    // Update bubble base
-    nodeAll.select('.bubble-base')
-      .attr('r', d => d.r)
-      .attr('fill', d => d.data.id===selectedId ? '#fff' : (d.data.children ? hexToRgba(d.color,0.12) : d.color))
-      .attr('stroke', d => d.data.id===selectedId ? '#fff' : d.color)
-      // Enhancement 7: depth-based glow strength
-      .attr('filter', d => `url(#glow-d${Math.min(d.depth,3)})`)
+    // Cache label elements for zoom handler
+    labelElsRef.current = nodeAll.selectAll('.bubble-label').nodes()
 
-    // Enhancement 9: expand-hint ring styling
-    nodeAll.select('.expand-hint-ring')
-      .attr('stroke', d => d.data.hasChildren && !d.data.children ? d.color : 'none')
-      .classed('ring-pulse', d => d.data.hasChildren && !d.data.children)
-
-    // Enhancement 4: pulse ring for selected
-    nodeAll.select('.pulse-ring')
-      .attr('stroke', d => d.data.id===selectedId ? d.color : 'none')
-      .classed('selected-pulse', d => d.data.id===selectedId)
-
-    // Image Collage – rebuild inside each node based on available images
-    nodeAll.each(function(d) {
-      const sel      = d3.select(this)
-      const wrap     = sel.select('.collage-wrap')
-      const r        = d.r
-      // Gather images: prefer cladeMetaData gallery (up to 4), fall back to nodeIcons
-      const gallery  = cladeMetaData[d.data.id]?.images || []
-      const icon     = nodeIcons[d.data.id]
-      const imgs     = gallery.length ? gallery.slice(0, 4) : (icon ? [icon] : [])
-
-      // Clear previous collage tiles
-      wrap.selectAll('*').remove()
-
-      if (imgs.length === 0) return
-
-      const n = imgs.length
-
-      if (n === 1) {
-        // Full-circle fill
-        wrap.append('image')
-          .attr('xlink:href', imgs[0])
-          .attr('x', -r).attr('y', -r)
-          .attr('width', r*2).attr('height', r*2)
-          .attr('preserveAspectRatio', 'xMidYMid slice')
-
-      } else if (n === 2) {
-        // Left / Right split
-        imgs.forEach((url, i) => {
-          wrap.append('image')
-            .attr('xlink:href', url)
-            .attr('x', i === 0 ? -r : 0).attr('y', -r)
-            .attr('width', r).attr('height', r*2)
-            .attr('preserveAspectRatio', 'xMidYMid slice')
-        })
-        // Hairline divider
-        wrap.append('line').attr('x1', 0).attr('y1', -r).attr('x2', 0).attr('y2', r)
-          .attr('stroke', 'rgba(0,0,0,0.4)').attr('stroke-width', 1)
-
-      } else if (n === 3) {
-        // Top-left, top-right (half height), bottom (full width, half height)
-        wrap.append('image').attr('xlink:href', imgs[0])
-          .attr('x', -r).attr('y', -r).attr('width', r).attr('height', r)
-          .attr('preserveAspectRatio', 'xMidYMid slice')
-        wrap.append('image').attr('xlink:href', imgs[1])
-          .attr('x', 0).attr('y', -r).attr('width', r).attr('height', r)
-          .attr('preserveAspectRatio', 'xMidYMid slice')
-        wrap.append('image').attr('xlink:href', imgs[2])
-          .attr('x', -r).attr('y', 0).attr('width', r*2).attr('height', r)
-          .attr('preserveAspectRatio', 'xMidYMid slice')
-        // Dividers
-        wrap.append('line').attr('x1',-r).attr('y1',0).attr('x2',r).attr('y2',0)
-          .attr('stroke','rgba(0,0,0,0.4)').attr('stroke-width',1)
-        wrap.append('line').attr('x1',0).attr('y1',-r).attr('x2',0).attr('y2',0)
-          .attr('stroke','rgba(0,0,0,0.4)').attr('stroke-width',1)
-
-      } else {
-        // 2×2 quad grid (4 images)
-        imgs.forEach((url, i) => {
-          const col = i % 2, row = Math.floor(i / 2)
-          wrap.append('image').attr('xlink:href', url)
-            .attr('x', col === 0 ? -r : 0).attr('y', row === 0 ? -r : 0)
-            .attr('width', r).attr('height', r)
-            .attr('preserveAspectRatio', 'xMidYMid slice')
-        })
-        // Crosshair dividers
-        wrap.append('line').attr('x1',-r).attr('y1',0).attr('x2',r).attr('y2',0)
-          .attr('stroke','rgba(0,0,0,0.45)').attr('stroke-width',1.5)
-        wrap.append('line').attr('x1',0).attr('y1',-r).attr('x2',0).attr('y2',r)
-          .attr('stroke','rgba(0,0,0,0.45)').attr('stroke-width',1.5)
-      }
-    })
-
-    // Labels
-    nodeAll.select('.bubble-label')
-      .text(d => d.data.name)
-      .attr('dy', d => d.data.children ? -(d.r+20) : '0.35em')
-      .style('font-size', d => d.data.children ? `${Math.min(22,Math.max(11,d.r*0.22))}px` : `${labelConfig.fontSize}px`)
-      .style('font-weight','700').style('letter-spacing','0.04em')
-      .style('text-shadow','0 1px 8px rgba(0,0,0,1)').attr('fill','#fff')
-
-    // ── Enhancement 1+2: Force simulation ───────────────────────────────────
-    const sim = d3.forceSimulation(allNodes)
-      .force('link', d3.forceLink(allLinks).id(d => d.data.id)
-        .distance(d => d.source.r + d.target.r + 90).strength(0.85))
-      .force('charge', d3.forceManyBody().strength(d => d.data.children ? -2200 : -600))
-      .force('collide', d3.forceCollide().radius(d => d.r+28).iterations(4))
-      .force('radial', d3.forceRadial(d => d.depth===0 ? 0 : d.depth*420, 0, 0).strength(d => d.depth===0 ? 2 : 0.5))
-      .velocityDecay(0.65).alpha(0.6).alphaDecay(0.022)
-
-    simRef.current = sim
-
-    // Enhancement 6: update gradient coordinates every tick
-    const updateGradients = () => {
-      allLinks.forEach(lk => {
-        const grad = defsRef.current?.querySelector(`#${gradId(lk.source,lk.target)}`)
-        if (grad) {
-          grad.setAttribute('x1', lk.source.x); grad.setAttribute('y1', lk.source.y)
-          grad.setAttribute('x2', lk.target.x); grad.setAttribute('y2', lk.target.y)
-        }
-      })
-    }
-
-    // Enhancement 2: quadratic bezier links
+    // ── Link path (quadratic bezier) ──
     const linkPath = d => {
       const mx = (d.source.x + d.target.x)/2, my = (d.source.y + d.target.y)/2
       const dx = d.target.y - d.source.y, dy = d.source.x - d.target.x
@@ -395,27 +278,188 @@ export default function TreeCanvas({
       return `M${d.source.x},${d.source.y} Q${cx},${cy} ${d.target.x},${d.target.y}`
     }
 
-    sim.on('tick', () => {
-      allNodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
-      updateGradients()
-      linkAll.attr('d', linkPath)
-      nodeAll.attr('transform', d => `translate(${d.x},${d.y})`)
-      // Keep nebulas centered on their parent
-      nebulaLayer.selectAll('circle.nebula').attr('cx', d => d.x||0).attr('cy', d => d.y||0)
-    })
+    // ── Simulation: incremental ──
+    const n = allNodes.length
+    const needsFullBuild = isFirstRender || isMajorChange || !simRef.current
 
-    // Enhancement 10: auto-fit after simulation settles
-    sim.on('end', () => {
-      allNodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
-      autoFit(allNodes)
-    })
+    if (needsFullBuild) {
+      // Full build: create new simulation
+      if (simRef.current) simRef.current.stop()
 
-  }, [onNodeSelect, onNodeExpand, onNodeCollapse, cladeMetaData, nodeIcons, labelConfig, autoFit])
+      const collideIter = n > 80 ? 1 : n > 30 ? 2 : 4
+      const chargeStr = n > 80 ? (d => d.data.children ? -900 : -250)
+                      : n > 30 ? (d => d.data.children ? -1500 : -400)
+                      :          (d => d.data.children ? -2200 : -600)
 
+      const sim = d3.forceSimulation(allNodes)
+        .force('link', d3.forceLink(allLinks).id(d => d.data.id)
+          .distance(d => d.source.r + d.target.r + 90).strength(0.85))
+        .force('charge', d3.forceManyBody().strength(chargeStr).theta(0.9))
+        .force('collide', d3.forceCollide().radius(d => d.r+28).iterations(collideIter))
+        .force('radial', d3.forceRadial(d => d.depth===0 ? 0 : d.depth*420, 0, 0).strength(d => d.depth===0 ? 2 : 0.5))
+        .velocityDecay(0.65).alpha(0.6).alphaDecay(n > 80 ? 0.04 : 0.022)
+
+      simRef.current = sim
+      setupTickHandler(sim, allNodes, linkAll, nodeAll, linkPath)
+
+      sim.on('end', () => {
+        allNodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
+        computeHulls(allNodes)
+        autoFit(allNodes)
+      })
+    } else {
+      // Incremental: update existing simulation with new nodes/links
+      const sim = simRef.current
+      sim.stop()
+
+      const collideIter = n > 80 ? 1 : n > 30 ? 2 : 4
+      const chargeStr = n > 80 ? (d => d.data.children ? -900 : -250)
+                      : n > 30 ? (d => d.data.children ? -1500 : -400)
+                      :          (d => d.data.children ? -2200 : -600)
+
+      sim.nodes(allNodes)
+      sim.force('link', d3.forceLink(allLinks).id(d => d.data.id)
+        .distance(d => d.source.r + d.target.r + 90).strength(0.85))
+      sim.force('charge', d3.forceManyBody().strength(chargeStr).theta(0.9))
+      sim.force('collide', d3.forceCollide().radius(d => d.r+28).iterations(collideIter))
+      sim.force('radial', d3.forceRadial(d => d.depth===0 ? 0 : d.depth*420, 0, 0).strength(d => d.depth===0 ? 2 : 0.5))
+
+      // Remove old tick/end handlers, attach new ones with current selections
+      sim.on('tick', null).on('end', null)
+      setupTickHandler(sim, allNodes, linkAll, nodeAll, linkPath)
+
+      sim.on('end', () => {
+        allNodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
+        computeHulls(allNodes)
+        autoFit(allNodes)
+      })
+
+      // Gentle restart — existing nodes barely move
+      sim.alpha(0.3).alphaDecay(n > 80 ? 0.04 : 0.022).restart()
+    }
+
+    function setupTickHandler(sim, nodes, links, nodeGroups, pathFn) {
+      let rafId = null
+      sim.on('tick', () => {
+        nodes.forEach(d => { posCache.current[d.data.id]={x:d.x,y:d.y} })
+        if (rafId) return
+        rafId = requestAnimationFrame(() => {
+          rafId = null
+          links.attr('d', pathFn)
+          nodeGroups.attr('transform', d => `translate(${d.x},${d.y})`)
+        })
+      })
+    }
+
+    // ── LOD Hull computation ─────────────────────────────────────────────
+    // Called on sim 'end' — computes convex hulls for expanded clades with >5 children
+    function computeHulls(nodes) {
+      const hulls = new Map()
+      const hLayer = d3.select(gRef.current).select('.hull-layer')
+      if (hLayer.empty()) return
+
+      // Find expanded clades with >5 children
+      nodes.forEach(d => {
+        if (!d.children || d.children.length <= 5) return
+        const childPoints = d.children.map(c => [c.x, c.y]).filter(p => isFinite(p[0]) && isFinite(p[1]))
+        if (childPoints.length < 3) return
+
+        // Add padding around points
+        const padded = []
+        const pad = 40
+        childPoints.forEach(([x, y]) => {
+          padded.push([x - pad, y - pad])
+          padded.push([x + pad, y - pad])
+          padded.push([x - pad, y + pad])
+          padded.push([x + pad, y + pad])
+        })
+        const hull = d3.polygonHull(padded)
+        if (!hull) return
+
+        // Centroid for label placement
+        const cx = d3.mean(childPoints, p => p[0])
+        const cy = d3.mean(childPoints, p => p[1])
+
+        hulls.set(d.data.id, {
+          points: hull,
+          path: 'M' + hull.map(p => p.join(',')).join('L') + 'Z',
+          color: d.color,
+          label: d.data.name,
+          numTips: d.data.num_tips,
+          cx, cy,
+          childIds: d.children.map(c => c.data.id),
+        })
+      })
+
+      hullsRef.current = hulls
+
+      // Render hull SVG elements
+      const hullData = [...hulls.entries()]
+      const hullSel = hLayer.selectAll('g.hull-group').data(hullData, d => d[0])
+      hullSel.exit().remove()
+
+      const hullEnter = hullSel.enter().append('g').attr('class', 'hull-group')
+      hullEnter.append('path').attr('class', 'hull-path')
+      hullEnter.append('text').attr('class', 'hull-label')
+        .attr('text-anchor', 'middle').attr('pointer-events', 'none')
+
+      const hullAll = hullEnter.merge(hullSel)
+      hullAll.select('.hull-path')
+        .attr('d', d => d[1].path)
+        .attr('fill', d => hexToRgba(d[1].color, 0.12))
+        .attr('stroke', d => hexToRgba(d[1].color, 0.3))
+        .attr('stroke-width', 2)
+        .attr('stroke-linejoin', 'round')
+
+      hullAll.select('.hull-label')
+        .attr('x', d => d[1].cx)
+        .attr('y', d => d[1].cy)
+        .attr('fill', d => d[1].color)
+        .style('font-size', '18px')
+        .style('font-weight', '800')
+        .style('font-family', "'Exo 2', sans-serif")
+        .style('text-transform', 'uppercase')
+        .style('letter-spacing', '0.08em')
+        .style('text-shadow', '0 2px 12px rgba(0,0,0,0.9)')
+        .text(d => `${d[1].label}  ·  ${fmtNum(d[1].numTips)} spp`)
+    }
+
+  }, [onNodeSelect, onNodeExpand, onNodeCollapse, autoFit])
+
+  // Run render on treeData change
   useEffect(() => {
     if (!treeData) return
-    renderTree(treeData, selectedNodeId)
-  }, [treeData, selectedNodeId, renderTree])
+    renderTree(treeData)
+  }, [treeData, renderTree])
+
+  // ── Styling (decoupled from physics) ───────────────────────────────────────
+  useEffect(() => {
+    if (!gRef.current) return
+    const g = d3.select(gRef.current)
+    const nodeAll = g.selectAll('g.node-group')
+    if (nodeAll.empty()) return
+
+    nodeAll.select('.bubble-base')
+      .attr('r', d => d.r)
+      .attr('fill', d => d.data.id === selectedNodeId ? '#fff' : (d.data.children ? hexToRgba(d.color,0.35) : d.color))
+      .attr('stroke', d => d.data.id === selectedNodeId ? '#fff' : d.color)
+
+    nodeAll.select('.expand-hint-ring')
+      .attr('stroke', d => d.data.hasChildren && !d.data.children ? d.color : 'none')
+      .classed('ring-pulse', d => d.data.hasChildren && !d.data.children)
+
+    nodeAll.select('.pulse-ring')
+      .attr('stroke', d => d.data.id === selectedNodeId ? d.color : 'none')
+      .classed('selected-pulse', d => d.data.id === selectedNodeId)
+
+    nodeAll.select('.bubble-label')
+      .text(d => d.data.name)
+      .attr('dy', d => d.data.children ? -(d.r+20) : '0.35em')
+      .style('font-size', d => d.data.children ? `${Math.min(22,Math.max(11,d.r*0.22))}px` : `${labelConfig.fontSize}px`)
+      .style('font-weight','700').style('letter-spacing','0.04em')
+      .style('text-shadow','0 1px 8px rgba(0,0,0,1)').attr('fill','#fff')
+
+  }, [treeData, selectedNodeId, labelConfig])
 
   return (
     <div className="tree-canvas-wrap">
@@ -437,28 +481,13 @@ export default function TreeCanvas({
 
       <svg ref={svgRef} className="tree-svg">
         <defs>
-          {/* Enhancement 7: depth-banded glows */}
-          {[0,1,2,3].map(d => (
-            <filter key={d} id={`glow-d${d}`} x="-50%" y="-50%" width="200%" height="200%">
-              <feDropShadow dx="0" dy="0" stdDeviation={10-d*2} floodColor="currentColor" floodOpacity={0.5-d*0.08}/>
-              <feDropShadow dx="0" dy="3" stdDeviation="6" floodColor="#000" floodOpacity="0.5"/>
-            </filter>
-          ))}
-          <filter id="aura-blur"><feGaussianBlur stdDeviation="18"/></filter>
           <radialGradient id="bg-gradient">
             <stop offset="0%"   stopColor="#0D1B30"/>
             <stop offset="100%" stopColor="#02060F"/>
           </radialGradient>
-          <radialGradient id="glass-gradient" cx="28%" cy="22%" r="72%">
-            <stop offset="0%"   stopColor="rgba(255,255,255,0.55)"/>
-            <stop offset="40%"  stopColor="rgba(255,255,255,0.06)"/>
-            <stop offset="100%" stopColor="rgba(0,0,0,0.35)"/>
-          </radialGradient>
           <style>{`
             .bubble-label { font-family: 'Exo 2', 'Outfit', sans-serif; user-select: none; }
-            .link-edge { transition: stroke-opacity 0.3s; }
 
-            /* Enhancement 4: selected-node pulse ring */
             @keyframes selected-pulse-anim {
               0%   { r: attr(r); opacity: 0.9; stroke-width: 2.5; }
               70%  { opacity: 0; stroke-width: 0.5; }
@@ -466,14 +495,12 @@ export default function TreeCanvas({
             }
             .selected-pulse { animation: selected-pulse-anim 1.8s ease-out infinite; }
 
-            /* Enhancement 9: hover expand-hint ring */
             @keyframes ring-spin {
               to { stroke-dashoffset: -40; }
             }
             .ring-pulse { animation: ring-spin 3s linear infinite; opacity: 0.5; }
             .node-group:hover .ring-pulse { opacity: 1; }
 
-            /* Tooltip */
             .node-tooltip {
               position: fixed;
               background: rgba(6,14,34,0.94);

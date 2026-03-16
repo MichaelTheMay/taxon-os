@@ -1,3 +1,5 @@
+import { getAPICache, setAPICache } from './CacheManager'
+
 const BASE = '/otl-api'
 
 async function post(path, body) {
@@ -44,15 +46,22 @@ export async function fetchChildren(nodeId) {
   // Limit to top 30 to avoid hammering the API
   children = children.slice(0, 30)
   
-  // 3. Look up synthetic tree info for the children to get the correct branch sizes (num_tips)
+  // 3. Fetch num_tips for all children in parallel, with IndexedDB caching
   const nodes = await Promise.all(children.map(async c => {
-    const nInfo = await post('/tree_of_life/node_info', { node_id: `ott${c.ott_id}` }).catch(() => null)
+    const cacheKey = `ott${c.ott_id}`
+    const cached = await getAPICache('otl_node_info', cacheKey)
+    let numTips = cached?.num_tips
+    if (numTips == null) {
+      const nInfo = await post('/tree_of_life/node_info', { node_id: cacheKey }).catch(() => null)
+      numTips = nInfo?.num_tips || 1
+      setAPICache('otl_node_info', cacheKey, { num_tips: numTips })
+    }
     return {
-      id: `ott${c.ott_id}`,
-      node_id: `ott${c.ott_id}`,
+      id: cacheKey,
+      node_id: cacheKey,
       name: c.name,
       rank: c.rank || 'no rank',
-      num_tips: nInfo?.num_tips || 1,
+      num_tips: numTips,
       ott_id: c.ott_id,
     }
   }))

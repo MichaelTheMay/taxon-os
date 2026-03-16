@@ -1,11 +1,17 @@
 const BASE = 'https://api.gbif.org/v1'
 
-export async function matchGBIF(name) {
+export async function matchGBIF(name, opts = {}) {
   try {
-    const res = await fetch(`${BASE}/species/match?name=${encodeURIComponent(name)}&verbose=false`)
+    let url = `${BASE}/species/match?name=${encodeURIComponent(name)}&verbose=true`
+    // Scope to kingdom if provided (prevents cross-kingdom mismatches)
+    if (opts.kingdom) url += `&kingdom=${encodeURIComponent(opts.kingdom)}`
+    const res = await fetch(url)
     if (!res.ok) return null
     const data = await res.json()
-    if (data.matchType === 'NONE') return null
+    if (data.matchType === 'NONE') {
+      if (data.alternatives && data.alternatives.length > 0) return data.alternatives[0]
+      return null
+    }
     return data
   } catch { return null }
 }export async function fetchGBIFSpecies(usageKey) {
@@ -116,8 +122,10 @@ export async function fetchYearlyOccurrences(taxonKey) {
  */
 export async function fetchCladeImagery(taxonName) {
   try {
-    // We search by name to get better variety and handles cases where we don't have usageKey yet
-    const res = await fetch(`${BASE}/occurrence/search?scientificName=${encodeURIComponent(taxonName)}&mediaType=StillImage&limit=6`)
+    const match = await matchGBIF(taxonName)
+    if (!match || !match.usageKey) return []
+
+    const res = await fetch(`${BASE}/occurrence/search?taxonKey=${match.usageKey}&mediaType=StillImage&limit=20`)
     if (!res.ok) return []
     const data = await res.json()
     const images = []
